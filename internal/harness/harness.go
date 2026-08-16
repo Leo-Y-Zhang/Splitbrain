@@ -60,7 +60,9 @@ type Config struct {
 
 	// ValueMax is the largest value clients write. A small domain makes
 	// coincidental agreement likely and violations hard to see; a large one
-	// makes almost every value unique and almost every read decisive.
+	// makes almost every value unique and almost every read decisive. It must
+	// be at least minValueMax; a domain of one value is not a small domain but
+	// an impossible one.
 	ValueMax int
 
 	// Faults names the schedule: "none", "partition", or any kind understood
@@ -181,6 +183,18 @@ func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 	cfg = cfg.WithDefaults()
 	if t == nil || t.Nodes() == 0 {
 		return nil, fmt.Errorf("harness: empty topology")
+	}
+	if cfg.ValueMax < minValueMax {
+		// Refusing rather than hanging. A compare-and-swap has to move the
+		// register to a different value - a no-op CAS constrains nothing, and
+		// history.Validate rejects one - and generate finds that value by
+		// retrying. On a domain of one value there is nothing to retry towards,
+		// so the loop never ends. It would not end at the start of the run
+		// either, but the first time a client came to believe a key held the
+		// only value there is, at which point the run stops making progress,
+		// ignores Duration, and leaves its node processes behind.
+		return nil, fmt.Errorf("harness: value-max is %d; it must be at least %d, because a compare-and-swap needs two different values to move between",
+			cfg.ValueMax, minValueMax)
 	}
 
 	sched, err := BuildSchedule(t, cfg)
@@ -309,6 +323,12 @@ func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 		Elapsed:     time.Since(start),
 	}, nil
 }
+
+// minValueMax is the smallest value domain a run can use: a compare-and-swap
+// has to move the register between two different values, and generate finds the
+// second one by retrying, so one value is not a small domain but an impossible
+// one. Run refuses anything below this.
+const minValueMax = 2
 
 // generate picks the next operation for a client.
 //
