@@ -493,7 +493,13 @@ func cmdSweep(ctx context.Context, args []string) error {
 			unknown++
 		}
 		if err := checkExpectation(f.expect, verdict.Verdict); err != nil {
-			mismatches++
+			// A seed that reached no verdict is already counted as unknown, and
+			// counting it here as well would print a mismatch tally that says
+			// the store contradicted -expect on seeds where nothing was decided.
+			var undecided *noVerdict
+			if !errors.As(err, &undecided) {
+				mismatches++
+			}
 			if *stopEarly {
 				printVerdict(verdict, res)
 				return err
@@ -504,8 +510,25 @@ func cmdSweep(ctx context.Context, args []string) error {
 	total := hi - lo + 1
 	fmt.Printf("\nseeds=%d target=%s faults=%s linearizable=%d not-linearizable=%d unknown=%d mismatches=%d\n",
 		total, f.target, f.faults, lin, notLin, unknown, mismatches)
+	return sweepOutcome(f.expect, total, unknown, mismatches)
+}
+
+// sweepOutcome turns a sweep's tally into the error the exit status is read
+// from.
+//
+// Undecided seeds are answered first, and separately, for the same reason
+// checkExpectation tests for Unknown before it looks at -expect at all: the
+// absence of a verdict is not one of the verdicts, and it exits 2 whatever was
+// expected. Reporting those seeds as failed expectations put exit 1 on a sweep
+// that had established nothing about the store, which is a stronger claim than
+// an exhausted search can support.
+func sweepOutcome(expect string, total, unknown, mismatches int) error {
+	if unknown > 0 {
+		return &noVerdict{fmt.Sprintf("no verdict on %d of %d seeds: the search ran out of budget. "+
+			"Raise -max-visits, -max-cache-mb or -check-timeout, or run fewer operations per seed.", unknown, total)}
+	}
 	if mismatches > 0 {
-		return &expectationFailed{fmt.Sprintf("%d of %d seeds did not match -expect %s", mismatches, total, f.expect)}
+		return &expectationFailed{fmt.Sprintf("%d of %d seeds did not match -expect %s", mismatches, total, expect)}
 	}
 	return nil
 }

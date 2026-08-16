@@ -148,6 +148,46 @@ func TestAnUndecidedSearchIsNeverASuccessfulExit(t *testing.T) {
 	}
 }
 
+// TestASweepThatDecidedNothingIsNotAMismatch is the rule above, one level up,
+// where it was not true.
+//
+// checkExpectation gets every seed right on its own. The sweep then counted the
+// errors and returned one expectationFailed for the lot, so a sweep in which
+// nothing was decided exited 1 - "the store contradicted what you asked" - and
+// said so in words: `sweep -target kvsingle -seeds 1-2 -max-visits 1 -expect
+// any` printed "unknown=2 mismatches=2", then "2 of 2 seeds did not match
+// -expect any", and exited 1. Nothing about the store had been established.
+//
+// An undecided seed therefore wins over a decided mismatch, for the same reason
+// checkExpectation tests for Unknown before it looks at -expect at all.
+func TestASweepThatDecidedNothingIsNotAMismatch(t *testing.T) {
+	var undecided *noVerdict
+	var mismatch *expectationFailed
+
+	// Two seeds, both undecided, under -expect any.
+	if err := sweepOutcome("any", 2, 2, 2); !errors.As(err, &undecided) {
+		t.Fatalf("a sweep that decided nothing reported %T (%v); an undecided search exits 2, not 1", err, err)
+	}
+	if err := sweepOutcome("any", 2, 2, 0); !errors.As(err, &undecided) {
+		t.Fatalf("two undecided seeds reported %T (%v)", err, err)
+	}
+	// Mixed with real mismatches, the weaker claim is the only honest one: the
+	// budget ran out, so the sweep does not know what the other seeds would
+	// have said.
+	if err := sweepOutcome("linearizable", 5, 1, 3); !errors.As(err, &undecided) {
+		t.Fatalf("one undecided seed among the mismatches reported %T (%v)", err, err)
+	}
+
+	// A sweep that decided everything still reports a mismatch as one...
+	if err := sweepOutcome("linearizable", 5, 0, 3); !errors.As(err, &mismatch) {
+		t.Fatalf("three mismatched seeds reported %T (%v); that is exit 1", err, err)
+	}
+	// ...and a clean sweep is not an error at all.
+	if err := sweepOutcome("linearizable", 5, 0, 0); err != nil {
+		t.Fatalf("a sweep in which every seed matched returned %v", err)
+	}
+}
+
 // TestCommittedFixtures is the repository's cheapest piece of evidence: two
 // real histories, recorded from real processes over real sockets, whose
 // verdicts anyone can reproduce without running anything. If a change to the
