@@ -272,7 +272,7 @@ and the cases that look fine and are wrong, which is the same read a
 microsecond later.
 
 **Mutation evidence.** Every rule that matters is switched off in turn, the
-tests are run, and a named test has to die. **18 mutations, all killed**; see
+tests are run, and a named test has to die. **20 mutations, all killed**; see
 [MUTATIONS.md](MUTATIONS.md), which CI regenerates on a machine that is not mine
 and compares against what is committed. Two survived the first run and both were
 real holes: one rule had no test at all, and one *mutation* was too weak to
