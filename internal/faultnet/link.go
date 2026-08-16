@@ -71,6 +71,12 @@ const (
 	// Reset closes open connections immediately, and closes new ones as soon
 	// as they are accepted, so the peer sees a broken connection rather than
 	// a hang.
+	//
+	// Exactly when the peer learns that is the platform's business. Windows
+	// completes the connect and surfaces the reset on the first read; Linux
+	// often delivers it in time for Dial itself to fail with "connection
+	// reset by peer". Both count, and a client must not assume either: what
+	// Reset guarantees is that no round trip completes and nothing hangs.
 	Reset
 
 	// Refuse closes the listener, so a dial is refused by the operating

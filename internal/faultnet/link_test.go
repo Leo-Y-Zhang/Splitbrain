@@ -342,10 +342,23 @@ func TestResetBreaksOpenConnection(t *testing.T) {
 	}
 	t.Logf("open connection broken %v after Set(Reset)", elapsed)
 
-	// Still in force: a connection opened now is accepted and then dropped.
+	// Still in force: a connection opened now cannot carry a round trip.
+	//
+	// How the peer finds that out is the platform's business, and the two
+	// disagree. Windows completes the connect and the reset arrives on the
+	// first read; Linux delivers it fast enough that Dial itself returns
+	// "connection reset by peer". Both are Reset working. Asserting the
+	// Windows shape - which is what this test did until a Linux runner said
+	// otherwise - pins an accident of the machine it was written on. What
+	// matters, and what a client can rely on, is that no round trip succeeds
+	// and nothing is left hanging.
 	c2, err := net.DialTimeout("tcp", l.Addr(), 5*time.Second)
 	if err != nil {
-		t.Fatalf("dial under Reset should still be accepted: %v", err)
+		if isTimeout(err) {
+			t.Fatalf("dial under Reset hung instead of failing: %v", err)
+		}
+		t.Logf("dial under Reset failed at connect time: %v", err)
+		return
 	}
 	defer c2.Close()
 	if err := c2.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
