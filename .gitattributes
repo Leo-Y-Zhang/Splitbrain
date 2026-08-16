@@ -1,0 +1,7 @@
+# Go tooling expects LF, gofmt above all. Without this a checkout on a machine
+# with core.autocrlf=true gets CRLF working files, and the format job then
+# reports every file in the repository as unformatted - on a tree nobody edited.
+* text=auto eol=lf
+
+# Recorded histories are line-oriented evidence and are compared byte for byte.
+*.jsonl text eol=lf

@@ -1,0 +1,23 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.exe~
+*.test
+
+# Run artifacts: histories and reports are produced by `splitbrain run`,
+# and the ones worth keeping are committed under testdata/ deliberately.
+/runs/
+*.jsonl.tmp
+
+# Go
+/vendor/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Binaries the cluster launcher builds for a run
+/.bin/
