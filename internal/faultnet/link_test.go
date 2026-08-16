@@ -555,13 +555,52 @@ func TestSetUnderConcurrentTraffic(t *testing.T) {
 // promise than the one Close makes. That is only meaningful because the target
 // used here runs no goroutine per connection, so everything above the baseline
 // belongs to the link.
+// settledGoroutines waits for the goroutine count to stop moving and returns
+// it. A single reading races whatever the runtime happens to be finishing, and
+// a baseline that is one goroutine too low turns this test into a source of
+// failures nobody can reproduce.
+func settledGoroutines(within time.Duration) int {
+	deadline := time.Now().Add(within)
+	runtime.GC()
+	last := runtime.NumGoroutine()
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		runtime.GC()
+		n := runtime.NumGoroutine()
+		if n == last {
+			return n
+		}
+		last = n
+	}
+	return last
+}
+
 func TestCloseIsIdempotentAndLeavesNoGoroutines(t *testing.T) {
 	srv := quietServer(t)
 
-	// Settle first: the target's own goroutine must be in the baseline,
-	// otherwise this measures it instead of the link's.
-	runtime.GC()
-	base := runtime.NumGoroutine()
+	// Run a whole link through its life before measuring anything. The first
+	// link in a process brings up machinery that then stays up, and the race
+	// detector brings up more of it; measuring the baseline before that has
+	// happened attributes it to the link under test. That is how this test
+	// came to fail under -race and nowhere else - not a leak, a baseline taken
+	// in a different state from the number it was compared against.
+	warm, err := NewLink("warmup", srv)
+	if err != nil {
+		t.Fatalf("NewLink: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		c, err := net.DialTimeout("tcp", warm.Addr(), 5*time.Second)
+		if err != nil {
+			t.Fatalf("warm-up dial: %v", err)
+		}
+		_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_, _ = c.Write([]byte("hello"))
+		c.Close()
+	}
+	if err := warm.Close(); err != nil {
+		t.Fatalf("warm-up Close: %v", err)
+	}
+	base := settledGoroutines(5 * time.Second)
 
 	l, err := NewLink("leaky", srv)
 	if err != nil {
@@ -601,6 +640,9 @@ func TestCloseIsIdempotentAndLeavesNoGoroutines(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	closeTook := time.Since(start)
+	// Read immediately and without a GC: the whole claim is that Close does
+	// not return until its goroutines have gone, so anything that settles
+	// afterwards is exactly what this is looking for.
 	immediate := runtime.NumGoroutine()
 	t.Logf("Close returned in %v with %d goroutines against a baseline of %d", closeTook, immediate, base)
 
