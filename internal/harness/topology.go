@@ -244,9 +244,18 @@ func PartitionSchedule(t *Topology, seed int64, d time.Duration, f faultnet.Faul
 func singleNodeSchedule(names []string, seed int64, d time.Duration, f faultnet.Fault) (*faultnet.Schedule, error) {
 	rng := rand.New(rand.NewPCG(uint64(seed), 0x5EED))
 	var events []faultnet.Event
+	tail := d - (d / 8)
 	now := d / 8
-	for now < d-(d/8) {
+	for now < tail {
 		cutFor := jitter(rng, 200*time.Millisecond, 700*time.Millisecond)
+		// Clamped the way the multi-node path clamps it. A cut beginning just
+		// before the tail and lasting the full 700ms heals after the run has
+		// ended, and NewNamedSchedule then refuses the entire schedule - so a
+		// short single-node run failed to start at all, on 21 of 200 seeds at
+		// three seconds and on none at eight.
+		if now+cutFor > tail {
+			cutFor = tail - now
+		}
 		events = append(events,
 			faultnet.Event{At: now, Link: names[0], Fault: f},
 			faultnet.Event{At: now + cutFor, Link: names[0], Fault: faultnet.Pass},

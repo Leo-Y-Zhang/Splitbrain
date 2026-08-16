@@ -346,6 +346,52 @@ func TestSingleNodeScheduleStillProducesFaults(t *testing.T) {
 	}
 }
 
+// TestSingleNodeScheduleStaysInsideTheRun is the multi-node test above asked of
+// the other half of PartitionSchedule, which is where it was never asked.
+//
+// The single-node path blips one client link and then heals it, and the heal
+// was placed at now+cutFor with nothing to stop it landing after the run ends.
+// A cut may begin at any instant before d-d/8 and last up to 700ms, so any run
+// shorter than about 5.6s can generate a heal past its own duration - at which
+// point NewNamedSchedule refuses the whole schedule and `splitbrain run
+// -target kvsingle -duration 3s` dies before it has started a single process,
+// on some seeds and not others.
+//
+// Three seconds is not an arbitrary choice: it is what the campaign tests run
+// kvsingle for, so this was a seed away from being a flake in the suite that
+// proves the correct store is never accused.
+func TestSingleNodeScheduleStaysInsideTheRun(t *testing.T) {
+	topo, err := BuildTopology(deadAddrs(1), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer topo.Close()
+
+	for _, d := range []time.Duration{time.Second, 2 * time.Second, 3 * time.Second, 6 * time.Second} {
+		for seed := int64(0); seed < 20; seed++ {
+			s, err := PartitionSchedule(topo, seed, d, faultnet.Drop)
+			if err != nil {
+				t.Fatalf("duration %s, seed %d: %v", d, seed, err)
+			}
+			events := s.Events()
+			if len(events) == 0 {
+				t.Fatalf("duration %s, seed %d produced no events; a run that meets no timeouts proves nothing", d, seed)
+			}
+			for _, e := range events {
+				if e.At < 0 || e.At > d {
+					t.Fatalf("duration %s, seed %d: event at %s is outside [0,%s]", d, seed, e.At, d)
+				}
+			}
+			// The run has to end healed, or the final reads measure the
+			// network rather than the store.
+			last := events[len(events)-1]
+			if last.Fault != faultnet.Pass {
+				t.Fatalf("duration %s, seed %d ends with %s on %s rather than healed", d, seed, last.Fault, last.Link)
+			}
+		}
+	}
+}
+
 func TestRandomProperSubsetRefusesTinyClusters(t *testing.T) {
 	// The rejection loop would spin for ever looking for a subset that does
 	// not exist.
