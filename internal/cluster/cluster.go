@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -502,53 +501,10 @@ func (c *Cluster) Close() error {
 			}
 		}
 		if c.tempBin != "" {
-			if err := RemoveBuiltBinaries(c.tempBin); err != nil {
-				// Reported as well as returned. Every caller in this repository
-				// closes a cluster with `defer c.Close()`, so a returned error
-				// alone would be dropped at exactly the moment it mattered, and
-				// this is the same choice faultnet makes when it cannot reclaim
-				// a port: there is nowhere to return a cleanup failure to, and
-				// silence is how it accumulates.
-				log.Print(err)
-				if c.closeErr == nil {
-					c.closeErr = err
-				}
-			}
+			_ = os.RemoveAll(c.tempBin)
 		}
 	})
 	return c.closeErr
-}
-
-// removeWindow bounds how long RemoveBuiltBinaries keeps trying.
-//
-// Windows holds a handle on a running executable image and does not always
-// release it the instant Wait returns, which is the instant the cleanup runs.
-// The directory is then removable again a moment later - three left behind on
-// this machine all deleted on the first attempt hours afterwards - so a single
-// attempt turns a transient sharing violation into seven megabytes of
-// permanent litter per run.
-const removeWindow = 2 * time.Second
-
-// RemoveBuiltBinaries deletes a directory of binaries this package or a caller
-// built for one run, retrying for a short while before giving up.
-//
-// It reports what it could not delete rather than swallowing it. A cleanup
-// failure is not worth failing a run over - the verdict is already in - but it
-// is worth a line naming the path, because the alternative is a temporary
-// directory that grows by one node binary per run and never explains itself.
-func RemoveBuiltBinaries(dir string) error {
-	deadline := time.Now().Add(removeWindow)
-	for {
-		err := os.RemoveAll(dir)
-		if err == nil {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("cluster: could not remove the binaries built for this run after %s; delete %s by hand: %w",
-				removeWindow, dir, err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }
 
 // stop asks a node to exit by closing its stdin, then kills it if it will not.

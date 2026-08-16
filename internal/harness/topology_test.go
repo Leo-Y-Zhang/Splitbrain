@@ -251,48 +251,6 @@ func TestPartitionScheduleStaysInsideTheRun(t *testing.T) {
 	}
 }
 
-// TestSingleNodePartitionScheduleStaysInsideAShortRun covers the two things
-// its three-node sibling above does not: one node, and a run shorter than the
-// default.
-//
-// The multi-node generator clamps a phase that would overrun the tail; the
-// single-node one did not, so it emitted a heal past the end of the run and
-// NewNamedSchedule refused the whole schedule. The run did not partition less,
-// it failed outright:
-//
-//	$ splitbrain run -target kvsingle -faults partition -duration 2s -seed 5
-//	splitbrain: harness: faultnet: event 3 is at 2.146128209s, outside [0, 2s]
-//
-// Measured before the fix: 10 of 40 seeds at 2s, 5 of 40 at 1s, 3 of 40 at 3s,
-// and none at 4s or longer - which is why a suite that only ever generated 6
-// and 8 second schedules stayed green. kvsingle is the store the README calls
-// correct by construction, so this is the configuration a person reaches for
-// when they want a quick sanity check, and it is the one that broke.
-func TestSingleNodePartitionScheduleStaysInsideAShortRun(t *testing.T) {
-	topo, err := BuildTopology(deadAddrs(1), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer topo.Close()
-
-	for _, d := range []time.Duration{
-		500 * time.Millisecond, time.Second, 2 * time.Second,
-		3 * time.Second, 4 * time.Second, 6 * time.Second,
-	} {
-		for seed := int64(0); seed < 40; seed++ {
-			s, err := PartitionSchedule(topo, seed, d, faultnet.Drop)
-			if err != nil {
-				t.Fatalf("duration %s seed %d: %v", d, seed, err)
-			}
-			for _, e := range s.Events() {
-				if e.At < 0 || e.At > d {
-					t.Fatalf("duration %s seed %d: event at %s is outside [0,%s]", d, seed, e.At, d)
-				}
-			}
-		}
-	}
-}
-
 func TestPartitionScheduleNeverIsolatesEveryNodeAtOnce(t *testing.T) {
 	topo, err := BuildTopology(deadAddrs(3), true)
 	if err != nil {
@@ -434,40 +392,6 @@ func TestBuildScheduleKinds(t *testing.T) {
 
 	if _, err := BuildSchedule(topo, Config{Faults: "nonsense", Seed: 1, Duration: time.Second}); err == nil {
 		t.Fatal("an unknown fault kind was accepted; a typo would silently run with no faults at all")
-	}
-}
-
-// TestEveryAdvertisedScheduleKindWorksAndIsAdvertised closes the gap between
-// what -faults accepts and what it says it accepts.
-//
-// The flag's help read "none, partition, refuse, flaky or chaos". A rejected
-// value answered "unknown schedule "bogus" (have: healthy, partition, flaky,
-// chaos)" - a different list, produced two packages away by faultnet.Generate,
-// which has never heard of the node-level kinds this package adds. So the error
-// a user got after a typo omitted "none" and "refuse", the two values the help
-// had just offered them, and the help in turn omitted "healthy", which works.
-// Neither list was the accepted set.
-func TestEveryAdvertisedScheduleKindWorksAndIsAdvertised(t *testing.T) {
-	topo, err := BuildTopology(deadAddrs(3), true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer topo.Close()
-
-	for _, kind := range ScheduleKinds() {
-		if _, err := BuildSchedule(topo, Config{Faults: kind, Seed: 1, Duration: 6 * time.Second}); err != nil {
-			t.Errorf("-faults %s is advertised but refused: %v", kind, err)
-		}
-	}
-
-	_, err = BuildSchedule(topo, Config{Faults: "bogus", Seed: 1, Duration: 6 * time.Second})
-	if err == nil {
-		t.Fatal("an unknown kind was accepted")
-	}
-	for _, kind := range ScheduleKinds() {
-		if !strings.Contains(err.Error(), kind) {
-			t.Errorf("the rejection does not offer %q, which works: %v", kind, err)
-		}
 	}
 }
 

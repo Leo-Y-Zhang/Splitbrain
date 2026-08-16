@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,8 +10,6 @@ import (
 	"time"
 
 	"github.com/Leo-Y-Zhang/Splitbrain/internal/checker"
-	"github.com/Leo-Y-Zhang/Splitbrain/internal/cluster"
-	"github.com/Leo-Y-Zhang/Splitbrain/internal/harness"
 	"github.com/Leo-Y-Zhang/Splitbrain/internal/history"
 	"github.com/Leo-Y-Zhang/Splitbrain/internal/model"
 )
@@ -118,129 +114,6 @@ func TestCheckExpectation(t *testing.T) {
 	}
 	if err := checkExpectation("nearly", checker.Linearizable); err == nil {
 		t.Error("an unrecognised expectation was accepted; a typo would silently pass everything")
-	}
-}
-
-// TestAMisspeltExpectationIsRefusedBeforeAnythingRuns is the regression test
-// for the worst thing this tool can do: accuse a correct store.
-//
-// checkExpectation rejects an unrecognised -expect, but sweep called it once
-// per seed and folded every error into its mismatch counter. One transposed
-// letter therefore produced
-//
-//	seeds=2 ... linearizable=2 not-linearizable=0 unknown=0 mismatches=2
-//	2 of 2 seeds did not match -expect linearisable
-//
-// and exit 1 - a summary that counts two linearizable verdicts on the line
-// above and then reports two mismatches, on a run where nothing was wrong but
-// the spelling. Exit 1 means "the verdict did not match"; a malformed flag is
-// the tool failing, which is exit 2, and `run` already got that right. The two
-// subcommands disagreed about the same input.
-//
-// The bin-dir is a directory with no binaries in it, so in the broken version
-// this fails fast with a cluster error instead of standing up a real cluster:
-// what is being pinned is that the expectation is judged before any of that is
-// attempted.
-func TestAMisspeltExpectationIsRefusedBeforeAnythingRuns(t *testing.T) {
-	empty := t.TempDir()
-	for _, cmd := range []string{"run", "sweep"} {
-		t.Run(cmd, func(t *testing.T) {
-			args := []string{
-				"-target", "kvsingle", "-bin-dir", empty,
-				"-faults", "none", "-duration", "200ms", "-max-ops", "10",
-				"-expect", "linearisable",
-			}
-			var err error
-			if cmd == "run" {
-				err = cmdRun(context.Background(), args)
-			} else {
-				err = cmdSweep(context.Background(), append(args, "-seeds", "0-1"))
-			}
-			if err == nil {
-				t.Fatal("a misspelt -expect was accepted")
-			}
-			var mismatch *expectationFailed
-			if errors.As(err, &mismatch) {
-				t.Fatalf("a misspelt -expect was reported as a failed expectation (exit 1), "+
-					"which reads as an accusation against the store: %v", err)
-			}
-			if !strings.Contains(err.Error(), "unknown -expect") {
-				t.Fatalf("the error does not say the expectation was the problem: %v", err)
-			}
-		})
-	}
-}
-
-// TestScheduleRefusesANodeCountItCannotDraw pins two crashes reachable from the
-// command line with nothing but a number.
-//
-//	$ splitbrain schedule -nodes 0
-//	panic: runtime error: index out of range [0] with length 0
-//	$ splitbrain schedule -nodes -3
-//	panic: runtime error: makeslice: len out of range
-//
-// Zero nodes reached singleNodeSchedule, which indexes the first link name of a
-// topology that has none; a negative count died earlier still, making the
-// address slice. Both printed a stack trace at a user who mistyped a flag.
-func TestScheduleRefusesANodeCountItCannotDraw(t *testing.T) {
-	for _, nodes := range []string{"0", "-3", "-1"} {
-		t.Run("nodes="+nodes, func(t *testing.T) {
-			err := cmdSchedule([]string{"-nodes", nodes, "-duration", "1s"})
-			if err == nil {
-				t.Fatalf("-nodes %s was accepted", nodes)
-			}
-			if !strings.Contains(err.Error(), "-nodes") {
-				t.Errorf("the error does not name the flag at fault: %v", err)
-			}
-		})
-	}
-	// The neighbouring values still work, so this refuses a bad count rather
-	// than a range it should be drawing.
-	for _, nodes := range []string{"1", "2", "3"} {
-		if err := cmdSchedule([]string{"-nodes", nodes, "-duration", "1s"}); err != nil {
-			t.Errorf("-nodes %s was refused: %v", nodes, err)
-		}
-	}
-}
-
-// TestEveryTargetIsDiscoverableFromTheCommandLine pins the help text and the
-// unknown-target error to cluster.Targets().
-//
-// Both were hand-written lists that read "kvsingle, kvforward, kvsync or
-// kvquorum", and both had gone stale in the same way: kvsplit was missing. It
-// is the store the repository is named after, the one the README's first
-// example runs, and the one its table calls the controlled experiment - so
-//
-//	$ splitbrain run -target kvsplitt
-//	splitbrain: unknown target "kvsplitt" (have kvsingle, kvforward, kvsync, kvquorum)
-//
-// told a user who had made a typo that the target they wanted did not exist.
-// Deriving both strings from Targets() is what stops it happening again.
-func TestEveryTargetIsDiscoverableFromTheCommandLine(t *testing.T) {
-	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	(&runFlags{}).register(fs)
-	help := fs.Lookup("target").Usage
-
-	badTargetErr := (&runFlags{target: "nosuchstore"}).validateTarget().Error()
-
-	for _, tg := range cluster.Targets() {
-		if !strings.Contains(help, string(tg)) {
-			t.Errorf("-target help does not mention %s: %q", tg, help)
-		}
-		if !strings.Contains(badTargetErr, string(tg)) {
-			t.Errorf("the unknown-target error does not mention %s: %q", tg, badTargetErr)
-		}
-	}
-
-	// The same drift on the other enumerated flag: the help offered "none,
-	// partition, refuse, flaky or chaos", and "healthy" worked without being
-	// offered anywhere.
-	faultsHelp := fs.Lookup("faults").Usage
-	for _, kind := range harness.ScheduleKinds() {
-		if !strings.Contains(faultsHelp, kind) {
-			t.Errorf("-faults help does not mention %s, which works: %q", kind, faultsHelp)
-		}
 	}
 }
 

@@ -207,7 +207,7 @@ $ splitbrain check testdata/split-brain.jsonl
 splitbrain check: split-brain.jsonl, 795 operations across 1 key
                   (786 ok, 0 failed, 9 indeterminate), model=cas-register
 verdict: NOT LINEARIZABLE (231806 states in 21ms)
-  key "k0": read returned 258314, but the register held 690537 at that point
+  key "k0": read returned 258314, but the register held 554294 at that point
 ```
 
 ## Verdicts
