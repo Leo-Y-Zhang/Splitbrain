@@ -288,10 +288,7 @@ func startNode(ctx context.Context, bin, id string, opt Options) (*Node, error) 
 			_, _ = io.Copy(io.Discard, stderr)
 			return
 		}
-		sc := bufio.NewScanner(stderr)
-		for sc.Scan() {
-			fmt.Fprintf(opt.Stderr, "[%s] %s\n", id, sc.Text())
-		}
+		drainStderr(opt.Stderr, stderr, id)
 	}()
 
 	// The first line of stdout is the contract: "listening 127.0.0.1:PORT".
@@ -335,6 +332,34 @@ func startNode(ctx context.Context, bin, id string, opt Options) (*Node, error) 
 		return nil, fmt.Errorf("cluster: %s: %w", id, err)
 	}
 	return node, nil
+}
+
+// maxLogLine is how much of one log line the drain will hold in order to put a
+// node's identifier in front of it. The scanner's own default is 64 KB, which a
+// node that logs a whole request body goes past without trying.
+const maxLogLine = 1 << 20
+
+// drainStderr copies a node's log stream to dst, a line at a time with the node
+// named in front, and does not stop until the stream does.
+//
+// The fallback copy at the end looks redundant and is not. A scanner that ends
+// on an error stops reading, and the node on the other end has not stopped
+// writing: its stderr pipe fills, and it blocks for ever in the middle of a log
+// call, holding whatever lock it was under. What that looks like from the
+// outside is a node that went silent and then stopped answering, with nothing
+// pointing at the log line that did it. The prefix is worth giving up to keep
+// the pipe emptying; the drain is not.
+func drainStderr(dst io.Writer, r io.Reader, id string) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), maxLogLine)
+	for sc.Scan() {
+		fmt.Fprintf(dst, "[%s] %s\n", id, sc.Text())
+	}
+	// A clean end of stream reports no error, so this is only the trouble case.
+	if err := sc.Err(); err != nil {
+		fmt.Fprintf(dst, "[%s] this node's output can no longer be split into lines (%v); the rest is copied through as it arrives\n", id, err)
+		_, _ = io.Copy(dst, r)
+	}
 }
 
 // waitHealthy polls /health until it answers or the deadline passes.

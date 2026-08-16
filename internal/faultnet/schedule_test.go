@@ -277,6 +277,17 @@ func TestNewScheduleSortsAndCopies(t *testing.T) {
 	}
 }
 
+// doors are the two public constructors, driven through one signature. Both are
+// checked against the same table because they are one implementation, and the
+// day they stop being one is the day the named door starts accepting events the
+// other rejects.
+var doors = map[string]func(links []string, d time.Duration, events []Event) (*Schedule, error){
+	"NewSchedule": NewSchedule,
+	"NewNamedSchedule": func(links []string, d time.Duration, events []Event) (*Schedule, error) {
+		return NewNamedSchedule("partition", 7, links, d, events)
+	},
+}
+
 func TestNewScheduleRejectsBadEvents(t *testing.T) {
 	links := []string{"a", "b"}
 	const d = time.Second
@@ -291,17 +302,58 @@ func TestNewScheduleRejectsBadEvents(t *testing.T) {
 		{"unknown fault", Event{At: 0, Link: "a", Fault: Fault(99)}},
 		{"negative delay", Event{At: 0, Link: "a", Fault: Delay, Delay: -time.Second}},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := NewSchedule(links, d, []Event{tc.event}); err == nil {
-				t.Fatalf("NewSchedule accepted %+v", tc.event)
-			}
-		})
+	for door, build := range doors {
+		for _, tc := range cases {
+			t.Run(door+"/"+tc.name, func(t *testing.T) {
+				if _, err := build(links, d, []Event{tc.event}); err == nil {
+					t.Fatalf("%s accepted %+v", door, tc.event)
+				}
+			})
+		}
+		if _, err := build(links, -time.Second, nil); err == nil {
+			t.Errorf("%s accepted a negative duration", door)
+		}
+		if _, err := build(links, d, []Event{{At: d, Link: "*", Fault: Pass}}); err != nil {
+			t.Errorf(`%s rejected "*" or an event exactly at the end: %v`, door, err)
+		}
 	}
-	if _, err := NewSchedule(links, -time.Second, nil); err == nil {
-		t.Fatal("NewSchedule accepted a negative duration")
+}
+
+// TestNewNamedScheduleCarriesItsProvenance covers the one thing the named door
+// exists for. A harness that builds its own events still knows the generator
+// and seed it was asked for, and a report that says seed=0 under a seeded run
+// tells the reader the run cannot be replayed when it can.
+func TestNewNamedScheduleCarriesItsProvenance(t *testing.T) {
+	links := []string{"a", "b"}
+	events := []Event{
+		{At: 200 * time.Millisecond, Link: "a", Fault: Drop},
+		{At: 100 * time.Millisecond, Link: "b", Fault: Drop},
 	}
-	if _, err := NewSchedule(links, d, []Event{{At: d, Link: "*", Fault: Pass}}); err != nil {
-		t.Fatalf(`NewSchedule rejected "*" or an event exactly at the end: %v`, err)
+	s, err := NewNamedSchedule("partition", 3, links, time.Second, events)
+	if err != nil {
+		t.Fatalf("NewNamedSchedule: %v", err)
+	}
+	if s.Kind() != "partition" {
+		t.Errorf("Kind() = %q, want %q", s.Kind(), "partition")
+	}
+	if s.Seed() != 3 {
+		t.Errorf("Seed() = %d, want 3", s.Seed())
+	}
+	header := strings.SplitN(s.String(), "\n", 2)[0]
+	if !strings.Contains(header, "partition") || !strings.Contains(header, "seed=3") {
+		t.Errorf("header %q should carry the kind and the seed", header)
+	}
+	// Sorting and copying are the shared part, so they must survive the new door.
+	if got := s.Events(); got[0].At != 100*time.Millisecond {
+		t.Errorf("events were not sorted: %v", got)
+	}
+
+	// The plain door has no provenance to carry and must not invent any.
+	plain, err := NewSchedule(links, time.Second, events)
+	if err != nil {
+		t.Fatalf("NewSchedule: %v", err)
+	}
+	if plain.Kind() != "custom" || plain.Seed() != 0 {
+		t.Errorf("NewSchedule reports kind %q seed %d, want custom and 0", plain.Kind(), plain.Seed())
 	}
 }

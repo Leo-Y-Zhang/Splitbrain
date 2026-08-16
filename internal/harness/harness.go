@@ -185,6 +185,22 @@ func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 		return nil, fmt.Errorf("harness: empty topology")
 	}
 	if cfg.ValueMax < minValueMax {
+		return nil, fmt.Errorf("harness: value-max is %d; it must be at least %d, because a compare-and-swap "+
+			"needs two different values to move between", cfg.ValueMax, minValueMax)
+	}
+	if cfg.Clients < t.Nodes() {
+		// Clients are spread round-robin, so fewer clients than nodes leaves
+		// some node with nobody talking to it. The partition still cuts that
+		// node's peer links, the counters still show bytes dropped somewhere,
+		// and the run still returns a verdict - about hops that carried
+		// nothing. Measured: one client against three nodes gives five clean
+		// seeds in which the two followers answered four requests each, all of
+		// them after the network had healed.
+		return nil, fmt.Errorf("harness: %d client(s) across %d nodes; there must be at least one per node, "+
+			"or a partition cuts hops that were carrying no traffic and the clean verdict means nothing",
+			cfg.Clients, t.Nodes())
+	}
+	if cfg.ValueMax < minValueMax {
 		// Refusing rather than hanging. A compare-and-swap has to move the
 		// register to a different value - a no-op CAS constrains nothing, and
 		// history.Validate rejects one - and generate finds that value by
@@ -241,8 +257,14 @@ func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 			nodeName := clientLinkName(nodeIdx)
 			pn.set(proc, nodeName)
 
-			// Each client gets its own generator seeded from the run seed, so
-			// the workload replays even though the goroutines do not.
+			// Each client gets its own generator seeded from the run seed.
+			// That is not enough to replay the workload and the comment here
+			// used to say it was: the generator reads what this client last
+			// observed, which is whatever another client wrote a moment
+			// earlier, and it short-circuits on that value before drawing, so
+			// two runs of the same seed diverge within a few dozen operations
+			// and then stay diverged. Measured. The seed replays the fault
+			// schedule; nothing replays the run.
 			rng := rand.New(rand.NewPCG(uint64(cfg.Seed), uint64(0x9E3779B9+clientIdx)))
 			c := kv.NewClientWithOptions(t.ClientAddr(nodeIdx), cfg.OpTimeout,
 				kv.ClientOptions{KeepAlive: cfg.KeepAlive})

@@ -218,9 +218,21 @@ Three, not two:
 - **not linearizable** — the search was exhaustive and there is none.
 - **unknown** — the search ran out of budget.
 
-`unknown` is never collapsed into a pass, all the way out to the exit code.
-Linearizability checking is exponential in the worst case, and a tool that
-quietly reports "fine" when it gave up is worse than no tool.
+`unknown` is never collapsed into a pass, all the way out to the exit code: an
+undecided search exits **2**, whatever `-expect` says, because "any" means either
+verdict and an exhausted search is the absence of one. (It did not, at first.
+`check` defaults to `-expect any`, and `any` absorbed `unknown` into a zero exit
+— the claim was true in the text of the verdict and false in the number a
+pipeline reads.)
+
+There are three budgets, and all three end in `unknown` rather than a guess:
+`-max-visits` on model transitions, `-timeout` on the clock, and
+`-max-cache-mb` on what the search may remember. The last one exists because the
+first does not bound memory: transitions are counted, but each one can add a
+cache entry as wide as the key has operations, so a twelve-megabyte history file
+took **4.96 GB** of resident memory in 8.4 seconds under the old defaults and
+then reported `unknown` anyway. A history file is the artefact people pass
+around, so it is the input that has to be survivable.
 
 ## The checker
 
@@ -260,13 +272,24 @@ and the cases that look fine and are wrong, which is the same read a
 microsecond later.
 
 **Mutation evidence.** Every rule that matters is switched off in turn, the
-tests are run, and a named test has to die. **16 mutations, all killed**; see
+tests are run, and a named test has to die. **18 mutations, all killed**; see
 [MUTATIONS.md](MUTATIONS.md), which CI regenerates on a machine that is not mine
 and compares against what is committed. Two survived the first run and both were
 real holes: one rule had no test at all, and one *mutation* was too weak to
 observe, which is its own kind of false green.
 
 **The two correct stores**, under the same partitions, on every push.
+
+And then someone tried to break all of it. An adversarial generator — time
+squeezed onto a handful of instants, zero-width intervals, a two-value domain,
+mostly one process, mostly indeterminate — found **one** class the search and the
+oracle disagree on, in the generous direction: two operations on one key whose
+invocation and completion are the same instant each complete at or before the
+other is invoked, so no order respects real time, and the entry list picked one
+anyway. `Validate` now refuses that shape. With it removed, a further 100,000
+histories across two models produced no other disagreement, which is a much
+better result than the original generator could establish — it drew durations of
+one to six nanoseconds and could not reach the shape at all.
 
 ## Limits, stated plainly
 
@@ -285,6 +308,22 @@ observe, which is its own kind of false green.
 - **A clean verdict is evidence, not proof.** It says no violation appeared in
   the operations that were run under the faults that were injected. Sweeping
   seeds raises the confidence; it does not change the kind of claim.
+- **"Never accused" is a claim about the parameter space that was run.** The
+  demonstration's five seeds are one region of it. Under `-faults chaos` with
+  sixteen clients over eight keys, `kvsingle` comes back `unknown` on most
+  seeds — the checker failing closed rather than deciding, which is correct, but
+  it is not the same evidence as `5/5 linearizable`. Forty-five configurations
+  were attacked looking for a false accusation and none was found; that is a
+  stronger statement than any single table.
+- **There must be at least one client per node.** Clients are spread
+  round-robin, so fewer leaves a node nobody talks to; a partition then cuts
+  hops that were carrying nothing and the clean verdict means nothing. The
+  harness refuses the configuration rather than producing that evidence — it was
+  producing it, and a reviewer caught it.
+- **A node bound off loopback is reachable and unauthenticated.** `-addr` will
+  take anything, and `POST /configure` will point a node's leader at any URL. The
+  stores are fixtures and are meant to stay open; the binaries warn on stderr
+  when they are not on loopback.
 - **The race detector only runs in CI**, on Linux. It needs cgo, and the machine
   this was written on has no C toolchain.
 
@@ -307,7 +346,7 @@ tools/demo          the table above, executable; CI runs it on every push
 tools/mutations.py  the mutation evidence
 ```
 
-7,200 lines of Go and 6,400 lines of tests — 207 test functions, 316 cases
+7,500 lines of Go and 7,600 lines of tests — 233 test functions, 372 cases
 including subtests. **No dependencies**: standard library only, and CI fails if
 `go.sum` ever stops being empty.
 

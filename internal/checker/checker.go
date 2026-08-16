@@ -64,6 +64,20 @@ type Options struct {
 	// limit. Exceeding it yields Unknown, never a pass.
 	Timeout time.Duration
 
+	// MaxCacheBytes caps how much the search may remember per key, in bytes.
+	// Zero is no limit, which is a foot-gun rather than a default: the command
+	// line sets a real one.
+	//
+	// MaxVisits alone does not bound memory. It counts model transitions, and
+	// every transition can add a cache entry whose width grows with the number
+	// of operations on the key, so a large history reaches the visit budget
+	// having already allocated gigabytes. Measured before this existed: a
+	// twelve-megabyte history file took 4.96 GB of resident memory in 8.4
+	// seconds under the default flags, and then reported Unknown anyway. A
+	// history file is the artefact people pass around, so it is the input that
+	// has to be survivable.
+	MaxCacheBytes int
+
 	// Minimize asks for the smallest failing truncation of the history when a
 	// violation is found. It costs a handful of extra searches.
 	Minimize bool
@@ -406,11 +420,31 @@ type cacheEntry struct {
 type cache struct {
 	seed    maphash.Seed
 	buckets map[uint64][]cacheEntry
+	// bytes is a running estimate of what this cache is holding. It is an
+	// estimate because the map's own overhead is not observable from here; it
+	// tracks the part that grows without bound, which is the cloned bitsets.
+	bytes int
+	// entryBytes is what one entry costs: the bitset's words, plus a flat
+	// allowance for the entry struct and its share of the bucket slice.
+	entryBytes int
 }
 
-func newCache() *cache {
-	return &cache{seed: maphash.MakeSeed(), buckets: make(map[uint64][]cacheEntry)}
+// perEntryOverhead is the flat part of a cache entry's cost: the cacheEntry
+// struct, the interface holding the state, and a share of the slice header and
+// map bucket it lives in. Approximate on purpose - the point is a ceiling that
+// holds, not an exact figure.
+const perEntryOverhead = 64
+
+func newCache(words int) *cache {
+	return &cache{
+		seed:       maphash.MakeSeed(),
+		buckets:    make(map[uint64][]cacheEntry),
+		entryBytes: words*8 + perEntryOverhead,
+	}
 }
+
+// Bytes is the running estimate of what the cache holds.
+func (c *cache) Bytes() int { return c.bytes }
 
 // hash mixes the placed-set with the state. model.State is required to be
 // comparable, which is also what lets the bucket be scanned with ==.
@@ -430,6 +464,7 @@ func (c *cache) contains(lin bitset, s model.State) bool {
 func (c *cache) add(lin bitset, s model.State) {
 	h := c.hash(lin, s)
 	c.buckets[h] = append(c.buckets[h], cacheEntry{lin: lin.clone(), state: s})
+	c.bytes += c.entryBytes
 }
 
 // deadlineCheckEvery is how many loop iterations pass between clock reads. The
@@ -450,7 +485,7 @@ func searchKey(ops history.History, m model.Model, opt Options, deadline time.Ti
 
 	head := buildEntries(ops)
 	lin := newBitset(len(ops))
-	seen := newCache()
+	seen := newCache(len(lin))
 	state := m.Init()
 
 	// calls is the stack of operations placed so far, each with the state the
@@ -478,6 +513,16 @@ func searchKey(ops history.History, m model.Model, opt Options, deadline time.Ti
 		if !deadline.IsZero() && iters%deadlineCheckEvery == 0 && time.Now().After(deadline) {
 			kr.verdict = Unknown
 			kr.reason = fmt.Sprintf("undecided after %s, the time budget", opt.Timeout)
+			break
+		}
+		if opt.MaxCacheBytes > 0 && seen.Bytes() >= opt.MaxCacheBytes {
+			// Giving up here costs nothing in soundness: Unknown is already
+			// the honest verdict of a search that has not finished, and it is
+			// the one the visit budget would have produced a few seconds later
+			// after taking several more gigabytes to get there.
+			kr.verdict = Unknown
+			kr.reason = fmt.Sprintf("undecided after %s of remembered states, the memory budget",
+				humanBytes(seen.Bytes()))
 			break
 		}
 		iters++
@@ -540,6 +585,20 @@ func searchKey(ops history.History, m model.Model, opt Options, deadline time.Ti
 	kr.visits = visits
 	kr.elapsed = time.Since(start)
 	return kr
+}
+
+// humanBytes renders a size the way a person reading a verdict wants it.
+func humanBytes(n int) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.0f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.0f KB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d bytes", n)
+	}
 }
 
 // eventTimes lists, in order, the distinct times at which anything observable

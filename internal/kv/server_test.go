@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Leo-Y-Zhang/Splitbrain/internal/history"
@@ -181,6 +184,97 @@ func TestConfigureAcceptsAndReplaces(t *testing.T) {
 	}
 	if err := c.Configure(ctx, Config{Peers: &peers}); err != nil {
 		t.Errorf("second configure: %v", err)
+	}
+}
+
+// runBriefly binds addr, lets Run announce itself, stops it, and returns
+// everything it wrote to the two standard streams.
+//
+// It swaps os.Stdout and os.Stderr for pipes because those are what Run writes
+// to directly, and what a person starting a node actually sees. Nothing in this
+// package runs in parallel, so the swap cannot be observed by another test.
+func runBriefly(t *testing.T, addr string) (stdout, stderr string) {
+	t.Helper()
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	realOut, realErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = outW, errW
+	defer func() { os.Stdout, os.Stderr = realOut, realErr }()
+
+	// Both streams are read while Run is still going. Collecting them
+	// afterwards would deadlock the moment either pipe filled.
+	var wg sync.WaitGroup
+	var out, errs []byte
+	wg.Add(2)
+	go func() { defer wg.Done(); out, _ = io.ReadAll(outR) }()
+	go func() { defer wg.Done(); errs, _ = io.ReadAll(errR) }()
+
+	// Cancelled before it starts: Run still binds, warns and announces, then
+	// shuts down without serving anything, which is all this needs.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := Run(ctx, addr, "n0", NewSingleStore(), nil); err != nil {
+		t.Errorf("Run(%s): %v", addr, err)
+	}
+	outW.Close()
+	errW.Close()
+	wg.Wait()
+	outR.Close()
+	errR.Close()
+	return string(out), string(errs)
+}
+
+// TestRunWarnsWhenItBindsOffLoopback covers the one thing a person can act on.
+// These stores have no authentication by design, and /configure turns any node
+// that can be reached into something that will issue requests wherever it is
+// told, so a node bound to every interface is a different proposition from one
+// on loopback and the operator has to be told which they have started.
+func TestRunWarnsWhenItBindsOffLoopback(t *testing.T) {
+	// The warning names an address, so the test has to bind a real one; some
+	// sandboxes only allow loopback, and there is nothing to check there.
+	probe, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Skipf("this machine will not bind an unspecified address, so there is nothing to warn about: %v", err)
+	}
+	probe.Close()
+
+	stdout, stderr := runBriefly(t, "0.0.0.0:0")
+	addr, ok := strings.CutPrefix(strings.TrimSpace(stdout), "listening ")
+	if !ok {
+		t.Fatalf("stdout = %q, want a single \"listening <addr>\" line", stdout)
+	}
+	warning := strings.TrimRight(stderr, "\n")
+	if warning == "" {
+		t.Fatal("a node bound to every interface said nothing about it")
+	}
+	if strings.Contains(warning, "\n") {
+		t.Errorf("the warning is %d lines; one is what gets read:\n%s", strings.Count(warning, "\n")+1, warning)
+	}
+	for _, want := range []string{addr, "no authentication", "/configure"} {
+		if !strings.Contains(warning, want) {
+			t.Errorf("the warning does not mention %q:\n%s", want, warning)
+		}
+	}
+}
+
+// TestRunIsSilentOnLoopback keeps the warning from becoming noise. Every node
+// the harness starts is on loopback, and a warning printed dozens of times per
+// run is one nobody reads when it matters.
+func TestRunIsSilentOnLoopback(t *testing.T) {
+	stdout, stderr := runBriefly(t, "127.0.0.1:0")
+	if stderr != "" {
+		t.Errorf("a loopback node wrote to stderr:\n%s", stderr)
+	}
+	// The harness parses stdout for the address, so a warning that went there
+	// instead would be worse than no warning at all.
+	if !strings.HasPrefix(stdout, "listening 127.0.0.1:") || strings.Count(stdout, "\n") != 1 {
+		t.Errorf("stdout = %q, want exactly one \"listening 127.0.0.1:<port>\" line", stdout)
 	}
 }
 

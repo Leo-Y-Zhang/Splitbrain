@@ -42,7 +42,10 @@ usage:
 exit status:
   0  the verdict matched -expect
   1  it did not
-  2  the run could not produce a verdict
+  2  no verdict was reached - the search ran out of budget, or the tool failed
+
+an undecided search always exits 2, whatever -expect says. "unknown" is the
+absence of an answer, not one of the answers.
 
 run "splitbrain <command> -h" for the flags of one command.
 `
@@ -74,6 +77,11 @@ func main() {
 	}
 
 	if err != nil {
+		var undecided *noVerdict
+		if errors.As(err, &undecided) {
+			fmt.Fprintf(os.Stderr, "\n%s\n", undecided.Error())
+			os.Exit(2)
+		}
 		var mismatch *expectationFailed
 		if errors.As(err, &mismatch) {
 			fmt.Fprintf(os.Stderr, "\n%s\n", mismatch.Error())
@@ -90,6 +98,14 @@ func main() {
 type expectationFailed struct{ msg string }
 
 func (e *expectationFailed) Error() string { return e.msg }
+
+// noVerdict is an undecided search. It exits 2 rather than 0 or 1, because a
+// budget that ran out is not an answer and must not read like one - least of
+// all under -expect any, where "any" means either verdict and not "whatever
+// happened".
+type noVerdict struct{ msg string }
+
+func (e *noVerdict) Error() string { return e.msg }
 
 // runFlags is the shared configuration of `run` and `sweep`.
 type runFlags struct {
@@ -110,6 +126,7 @@ type runFlags struct {
 
 	modelName string
 	maxVisits int
+	maxCache  int
 	checkTmo  time.Duration
 	expect    string
 	verbose   bool
@@ -133,6 +150,7 @@ func (f *runFlags) register(fs *flag.FlagSet) {
 
 	fs.StringVar(&f.modelName, "model", "cas-register", "sequential model to check against")
 	fs.IntVar(&f.maxVisits, "max-visits", 2_000_000, "search budget per key; 0 for no limit")
+	fs.IntVar(&f.maxCache, "max-cache-mb", 512, "memory the search may remember per key, in MB; 0 for no limit")
 	fs.DurationVar(&f.checkTmo, "check-timeout", 60*time.Second, "wall-clock budget for the whole check")
 	fs.StringVar(&f.expect, "expect", "linearizable", "expected verdict: linearizable, not-linearizable or any")
 	fs.BoolVar(&f.verbose, "v", false, "print the fault timeline and per-link traffic")
@@ -155,7 +173,12 @@ func (f *runFlags) harnessConfig(seed int64) harness.Config {
 }
 
 func (f *runFlags) checkerOptions() checker.Options {
-	return checker.Options{MaxVisits: f.maxVisits, Timeout: f.checkTmo, Minimize: true}
+	return checker.Options{
+		MaxVisits:     f.maxVisits,
+		MaxCacheBytes: f.maxCache << 20,
+		Timeout:       f.checkTmo,
+		Minimize:      true,
+	}
 }
 
 // oneRun starts a cluster, runs the load and checks the history.
@@ -274,6 +297,7 @@ func cmdCheck(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
 	modelName := fs.String("model", "cas-register", "sequential model to check against")
 	maxVisits := fs.Int("max-visits", 2_000_000, "search budget per key; 0 for no limit")
+	maxCache := fs.Int("max-cache-mb", 512, "memory the search may remember per key, in MB; 0 for no limit")
 	timeout := fs.Duration("timeout", 60*time.Second, "wall-clock budget for the whole check")
 	expect := fs.String("expect", "any", "expected verdict: linearizable, not-linearizable or any")
 	reportPath := fs.String("report", "", "write a self-contained HTML report here")
@@ -305,7 +329,12 @@ func cmdCheck(args []string) error {
 	fmt.Printf("splitbrain check: %s, %s across %s (%d ok, %d failed, %d indeterminate), model=%s\n",
 		filepath.Base(path), plural(len(h), "operation"), plural(len(h.Keys()), "key"), ok, fail, info, m.Name())
 
-	verdict, err := checker.Check(h, m, checker.Options{MaxVisits: *maxVisits, Timeout: *timeout, Minimize: true})
+	verdict, err := checker.Check(h, m, checker.Options{
+		MaxVisits:     *maxVisits,
+		MaxCacheBytes: *maxCache << 20,
+		Timeout:       *timeout,
+		Minimize:      true,
+	})
 	if err != nil {
 		return err
 	}
@@ -534,6 +563,16 @@ func completion(op history.Op) string {
 // checkExpectation turns a verdict into an exit status.
 func checkExpectation(expect string, got checker.Verdict) error {
 	want := strings.ToLower(strings.TrimSpace(expect))
+	if want != "" && want != "any" && want != "linearizable" &&
+		want != "not-linearizable" && want != "not_linearizable" && want != "violation" {
+		return fmt.Errorf("unknown -expect %q (have linearizable, not-linearizable, any)", expect)
+	}
+	if got == checker.Unknown {
+		// Checked before the expectation, deliberately. An undecided search is
+		// not one of the answers -expect can ask for, and letting "any" absorb
+		// it would put a zero exit status on a run that decided nothing.
+		return &noVerdict{"no verdict: the search ran out of budget. Raise -max-visits, -max-cache-mb or -timeout, or check fewer operations."}
+	}
 	switch want {
 	case "", "any":
 		return nil
@@ -545,8 +584,6 @@ func checkExpectation(expect string, got checker.Verdict) error {
 		if got == checker.NotLinearizable {
 			return nil
 		}
-	default:
-		return fmt.Errorf("unknown -expect %q (have linearizable, not-linearizable, any)", expect)
 	}
 	return &expectationFailed{fmt.Sprintf("expected %s, got %s", want, got)}
 }

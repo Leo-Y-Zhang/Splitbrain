@@ -1,10 +1,13 @@
 package cluster
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestTargetValidity(t *testing.T) {
@@ -230,5 +233,87 @@ func TestCloseIsIdempotent(t *testing.T) {
 func TestReachableSaysNoForADeadPort(t *testing.T) {
 	if Reachable("127.0.0.1:9", 100_000_000) {
 		t.Skip("something is listening on the discard port on this machine")
+	}
+}
+
+// TestStderrDrainNeverStopsBeforeTheStreamDoes is the regression test for a
+// hang that looked nothing like its cause: one log line past the scanner's
+// limit ended the scan, the node's stderr pipe filled up behind it, and the
+// node blocked for ever on its next log write while the run waited on a node
+// that had simply gone quiet.
+//
+// It drives drainStderr over a real os.Pipe rather than through a built fake
+// node, because the pipe is the whole mechanism - a stalled reader really does
+// block the writer, so a drain that stops is a test that times out rather than
+// one that asserts a proxy for the problem. What it does not cover is the
+// wiring in startNode, which needs a real cluster.
+func TestStderrDrainNeverStopsBeforeTheStreamDoes(t *testing.T) {
+	cases := []struct {
+		name string
+		size int
+	}{
+		// Over the 64 KB the scanner allows by default, so the raised buffer is
+		// what keeps these lines split.
+		{"long line", 200_000},
+		// Past any buffer we are willing to hold, so only the fallback copy can
+		// keep the pipe emptying.
+		{"line past the cap", maxLogLine * 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("pipe: %v", err)
+			}
+			// Both ends are closed here as well as below, so a drain that has
+			// stopped cannot leave the fake node blocked in a write for the rest
+			// of the test binary's life.
+			t.Cleanup(func() { r.Close(); w.Close() })
+
+			var got bytes.Buffer
+			drained := make(chan struct{})
+			go func() {
+				defer close(drained)
+				drainStderr(&got, r, "n0")
+			}()
+
+			const marker = "the node is still logging"
+			written := make(chan error, 1)
+			go func() {
+				_, err := w.Write(append(bytes.Repeat([]byte("x"), tc.size), '\n'))
+				if err == nil {
+					_, err = w.Write([]byte(marker + "\n"))
+				}
+				written <- err
+			}()
+
+			select {
+			case err := <-written:
+				if err != nil {
+					t.Fatalf("the fake node could not write: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the fake node blocked writing its logs, so the drain stopped reading; this is the hang")
+			}
+
+			w.Close()
+			select {
+			case <-drained:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the drain did not return once the stream closed")
+			}
+
+			if !strings.Contains(got.String(), marker) {
+				t.Fatalf("what the node logged after the long line never reached the writer:\n%.400s", got.String())
+			}
+			if tc.size < maxLogLine && !strings.Contains(got.String(), "[n0] "+marker) {
+				t.Errorf("a line within the limit lost its node prefix:\n%.400s", got.String())
+			}
+			// Once the prefixes stop, the log has to say why, or the next reader
+			// concludes the wrong node wrote the rest of it.
+			if tc.size > maxLogLine && !strings.Contains(got.String(), "no longer be split") {
+				t.Errorf("nothing explains why the output stopped being split:\n%.400s", got.String())
+			}
+		})
 	}
 }

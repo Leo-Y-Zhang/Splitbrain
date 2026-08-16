@@ -301,6 +301,33 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Write(body)
 }
 
+// exposureWarning is the line to print when addr can be reached from beyond
+// this machine, and the empty string when it cannot.
+//
+// These stores are fixtures and POST /configure is unauthenticated on purpose,
+// which is fine on loopback and is something else entirely off it: whoever can
+// reach the port can set this node's leader to any address and path they like
+// and have it issue requests there, using this machine's network position. That
+// is not worth refusing to start over - a node run on another machine on
+// purpose is a legitimate thing to do - but it is worth saying out loud.
+//
+// It only means anything on an address that has already been bound, because
+// then the host is a literal the kernel chose. An unspecified one - "0.0.0.0",
+// "::", or nothing at all - is every interface on the machine, so it is not
+// loopback, and neither is anything ParseIP cannot read.
+func exposureWarning(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return ""
+	}
+	return fmt.Sprintf("warning: this node is listening on %s, so it is reachable from the network. "+
+		"It is a test fixture with no authentication: anyone who can reach it can POST /configure "+
+		"and make it send requests to any address they name. Use -addr 127.0.0.1:0 unless you meant this.", addr)
+}
+
 // Run is the body of every kv binary: bind, announce, serve, stop cleanly.
 //
 // It writes exactly one line to stdout, "listening <addr>\n", carrying the
@@ -320,6 +347,12 @@ func Run(ctx context.Context, addr, id string, store Store, logger *slog.Logger)
 	srv := NewServer(id, store, logger)
 	if err := srv.Listen(addr); err != nil {
 		return err
+	}
+	// Deliberately stderr and not stdout, which belongs to the address line, and
+	// deliberately plain text rather than a log line: it is addressed to whoever
+	// typed the command, not to whatever is parsing the logs.
+	if warning := exposureWarning(srv.Addr()); warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
 	}
 	// The signal handler goes in before the address is announced, and the
 	// order is load-bearing. Announcing is what tells a supervisor the node is

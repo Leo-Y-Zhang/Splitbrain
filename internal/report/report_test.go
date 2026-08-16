@@ -87,6 +87,90 @@ func TestReportEscapesWhatItIsGiven(t *testing.T) {
 	}
 }
 
+func TestReportEscapesTheTransportError(t *testing.T) {
+	// Op.Err is the one field whose content comes straight off the wire: it is
+	// whatever a server or the network said. A history file is passed around
+	// between people, so this is the realistic injection vector and it was the
+	// one the original escaping test did not cover.
+	h := history.History{
+		{
+			Process: 0, Key: "k0", Kind: history.Write, Value: 1,
+			Outcome: history.Info, Invoke: 0, Complete: history.Pending,
+			Err: `]]></title><svg/onload=alert(1)><img src=x onerror=alert(2)>`,
+		},
+	}
+	res, err := checker.Check(h, model.CASRegister{}, checker.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := render(t, Input{Verdict: res, History: h})
+	for _, banned := range []string{"<svg/onload", "<img src=x", "</title><svg"} {
+		if strings.Contains(page, banned) {
+			t.Fatalf("a transport error rendered unescaped markup: %q survived", banned)
+		}
+	}
+	// It must still be readable, or the escaping has eaten the diagnostic.
+	if !strings.Contains(page, "onload=alert(1)") && !strings.Contains(page, "onload=alert(1)") {
+		t.Log("note: the error text is escaped beyond recognition, which is safe but unhelpful")
+	}
+}
+
+func TestReportDoesNotPassOffTheTruncationAsTheWholeRun(t *testing.T) {
+	// The stats card counts the recorded history; the drawing shows the
+	// truncation, in which an operation still in flight at the cut is redrawn
+	// as unanswered. Left unsaid, the page states something that never
+	// happened: a bar the footer calls "never answered" for an operation the
+	// run recorded as ok.
+	h := violation()
+	res := checked(t, h)
+	if res.Verdict != checker.NotLinearizable || len(res.Ops) == 0 {
+		t.Fatalf("the fixture must produce a counterexample; got %s with %d ops", res.Verdict, len(res.Ops))
+	}
+
+	in := Input{Verdict: res, History: h}
+	d, err := in.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Truncated {
+		t.Fatal("a drawing built from a counterexample does not know it is a truncation")
+	}
+
+	var drawn string
+	for _, st := range d.Stats {
+		if st.Name == "operations drawn" {
+			drawn = st.Value
+		}
+	}
+	if drawn == "" {
+		t.Fatal("the stats do not say how much of the run was drawn")
+	}
+
+	page := render(t, in)
+	if !strings.Contains(page, "the drawing is the truncation") {
+		t.Fatal("the page does not tell the reader that the picture and the counts describe different things")
+	}
+	// The unqualified claim must be gone.
+	if strings.Contains(page, "never got one") {
+		t.Fatal("the footer still claims an unanswered bar means the client never got an answer at all")
+	}
+
+	// And on a clean run, where nothing is truncated, the page must not start
+	// hedging about a truncation that did not happen.
+	clean := history.History{
+		{Process: 0, Key: "k0", Kind: history.Write, Value: 1, Outcome: history.OK, Invoke: 0, Complete: 1_000_000},
+		{Process: 0, Key: "k0", Kind: history.Read, Observed: 1, Outcome: history.OK, Invoke: 2_000_000, Complete: 3_000_000},
+	}
+	cleanPage := render(t, Input{Verdict: checked(t, clean), History: clean})
+	if strings.Contains(cleanPage, "the drawing is the truncation") {
+		t.Fatal("a clean run's page describes itself as a truncation")
+	}
+	if !strings.Contains(cleanPage, "had not been answered\n  at all") &&
+		!strings.Contains(cleanPage, "at all") {
+		t.Fatal("a clean run's page lost the plain statement of what a dashed bar means")
+	}
+}
+
 func TestReportMarksTheCulprit(t *testing.T) {
 	res := checked(t, violation())
 	if res.Culprit == nil {

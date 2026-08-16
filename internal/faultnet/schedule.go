@@ -57,6 +57,18 @@ func newSchedule(kind string, seed int64, d time.Duration, events []Event) *Sche
 // that crosses the boundary at the same instant; which links those are is the
 // harness's business, so the harness works it out and hands the events over.
 func NewSchedule(links []string, d time.Duration, events []Event) (*Schedule, error) {
+	return NewNamedSchedule("custom", 0, links, d, events)
+}
+
+// NewNamedSchedule is NewSchedule for a caller that knows where its events came
+// from. The kind and seed are carried only so a report can say what produced
+// this timeline; nothing reads them back.
+//
+// The harness is the caller that needs it. It builds a partition out of its own
+// topology, so the events arrive here already made, and without this the report
+// for a seeded run says "custom seed=0" - which reads as a hand-written
+// timeline nobody can replay.
+func NewNamedSchedule(kind string, seed int64, links []string, d time.Duration, events []Event) (*Schedule, error) {
 	if d < 0 {
 		return nil, fmt.Errorf("faultnet: a schedule cannot last %v", d)
 	}
@@ -86,7 +98,7 @@ func NewSchedule(links []string, d time.Duration, events []Event) (*Schedule, er
 	// and reading the report is easier when they stay together.
 	sort.SliceStable(out, func(i, j int) bool { return out[i].At < out[j].At })
 
-	return newSchedule("custom", 0, d, out), nil
+	return newSchedule(kind, seed, d, out), nil
 }
 
 // Events lists the schedule's events in time order. The slice is a copy, so a

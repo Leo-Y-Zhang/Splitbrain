@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -100,7 +101,9 @@ func TestCheckExpectation(t *testing.T) {
 		{"not-linearizable", checker.NotLinearizable, true},
 		{"not-linearizable", checker.Linearizable, false},
 		{"not-linearizable", checker.Unknown, false},
-		{"any", checker.Unknown, true},
+		{"any", checker.Linearizable, true},
+		{"any", checker.NotLinearizable, true},
+		{"any", checker.Unknown, false},
 		{"", checker.NotLinearizable, true},
 	}
 	for _, c := range cases {
@@ -111,6 +114,36 @@ func TestCheckExpectation(t *testing.T) {
 	}
 	if err := checkExpectation("nearly", checker.Linearizable); err == nil {
 		t.Error("an unrecognised expectation was accepted; a typo would silently pass everything")
+	}
+}
+
+func TestAnUndecidedSearchIsNeverASuccessfulExit(t *testing.T) {
+	// The README says unknown is never collapsed into a pass "all the way out
+	// to the exit code", and for a while that was not true: `check` defaults
+	// to -expect any, and any absorbed unknown into a zero exit. A pipeline
+	// reads the exit code, so that made the claim false where it mattered.
+	//
+	// "any" means either verdict. An exhausted search is the absence of one.
+	for _, expect := range []string{"", "any", "linearizable", "not-linearizable"} {
+		err := checkExpectation(expect, checker.Unknown)
+		if err == nil {
+			t.Fatalf("-expect %q accepted an undecided search", expect)
+		}
+		var undecided *noVerdict
+		if !errors.As(err, &undecided) {
+			t.Fatalf("-expect %q reported an undecided search as %T; it must exit 2, not 1", expect, err)
+		}
+		if !strings.Contains(err.Error(), "budget") {
+			t.Errorf("the message does not say what to raise: %q", err)
+		}
+	}
+
+	// And a real verdict must not be mistaken for one.
+	for _, v := range []checker.Verdict{checker.Linearizable, checker.NotLinearizable} {
+		var undecided *noVerdict
+		if err := checkExpectation("any", v); errors.As(err, &undecided) {
+			t.Fatalf("%s was reported as no verdict", v)
+		}
 	}
 }
 

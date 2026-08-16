@@ -21,3 +21,8 @@ Thumbs.db
 
 # Binaries the cluster launcher builds for a run
 /.bin/
+
+# tools/mutations.py holds the original of the file it is mutating here, and
+# deletes it once the file is back. One left behind is a run that was killed;
+# the next run restores from it. The glob covers it mid-write.
+/.mutation-in-progress.json*

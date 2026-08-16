@@ -152,9 +152,13 @@ func run(ctx context.Context, seeds int, duration time.Duration, clients, keys, 
 			}
 		}
 
-		// A run that partitioned nothing and moved nothing is not evidence.
-		if res.dropped == 0 {
-			failures = append(failures, fmt.Sprintf("%s: the partition schedule dropped zero bytes across every seed", s.target))
+		// A run that partitioned nothing and moved nothing is not evidence,
+		// and the check has to be per seed. Summing lets one seed that broke
+		// something vouch for four that did not.
+		if res.seedsWithoutDrops > 0 {
+			failures = append(failures, fmt.Sprintf(
+				"%s: %d of %d seeds dropped zero bytes, so their verdicts are about a network that was never broken",
+				s.target, res.seedsWithoutDrops, res.total))
 		}
 		if res.forwarded == 0 {
 			failures = append(failures, fmt.Sprintf("%s: no bytes ever reached a node", s.target))
@@ -245,13 +249,20 @@ type sweepResult struct {
 	faults                                        string
 	total, linearizable, notLinearizable, unknown int
 	ops, dropped, forwarded                       int64
-	rows                                          []string
-	firstViolation                                string
+	// seedsWithoutDrops counts the seeds whose fault schedule swallowed
+	// nothing. Summing bytes across seeds hides this: one seed that dropped a
+	// few hundred carries four that dropped none past the gate.
+	seedsWithoutDrops int
+	rows              []string
+	firstViolation    string
 }
 
 func (r sweepResult) line() string {
 	s := fmt.Sprintf("seeds=%d linearizable=%d not-linearizable=%d unknown=%d operations=%d forwarded=%dB dropped=%dB",
 		r.total, r.linearizable, r.notLinearizable, r.unknown, r.ops, r.forwarded, r.dropped)
+	if r.faults != "none" && r.seedsWithoutDrops > 0 {
+		s += fmt.Sprintf(" [%d seed(s) dropped nothing]", r.seedsWithoutDrops)
+	}
 	if r.firstViolation != "" {
 		s += "\n  first violation: " + r.firstViolation
 	}
@@ -287,7 +298,7 @@ func sweep(ctx context.Context, target cluster.Target, nodes, seeds int, duratio
 				Faults:   faults,
 				Seed:     int64(seed),
 			},
-			Checker: checker.Options{MaxVisits: 3_000_000, Timeout: 90 * time.Second, Minimize: true},
+			Checker: checker.Options{MaxVisits: 3_000_000, MaxCacheBytes: 512 << 20, Timeout: 90 * time.Second, Minimize: true},
 			Model:   model.CASRegister{},
 		})
 		if err != nil {
@@ -298,6 +309,9 @@ func sweep(ctx context.Context, target cluster.Target, nodes, seeds int, duratio
 		res.ops += int64(len(out.Run.History))
 		res.dropped += out.DroppedBytes()
 		res.forwarded += out.ForwardedBytes()
+		if out.DroppedBytes() == 0 {
+			res.seedsWithoutDrops++
+		}
 
 		detail := ""
 		switch out.Check.Verdict {

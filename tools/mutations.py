@@ -7,12 +7,21 @@ runs the tests, and records which test died. A mutation that survives is a
 hole in the suite and fails this script, which is the point: the evidence is
 the list of deaths, not the list of tests.
 
-Two rules of the harness itself, both learned the hard way:
+Three rules of the harness itself, all learned the hard way:
 
   * the file is restored from a copy held in memory, never with git. A restore
     that goes through the working tree will happily revert the very change
     under test if the timing is unlucky, and then every mutation "dies" for
     the wrong reason;
+  * that copy in memory dies with the process, so the same text also goes to
+    a sidecar file at the repository root before the source is touched, and is
+    deleted once it is back. Ctrl-C is caught by the finally; a hard kill, an
+    out-of-memory kill or a power cut is caught by the next run, which restores
+    from the sidecar and says so before it does anything else. Still uncovered:
+    between the kill and that next run the mutant is what is on disk, so a
+    build, CI or a careless commit in between uses it, and two copies of this
+    script running at once share one sidecar and would restore each other's
+    files;
   * the anchor text is asserted to appear exactly once before anything is
     replaced. A replacement that silently matches nothing produces a mutant
     identical to the original, which of course "survives", and the report
@@ -28,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import re
 import shutil
@@ -38,6 +48,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EVIDENCE = ROOT / "MUTATIONS.md"
+
+# The record of a mutation currently applied. It sits at the repository root
+# rather than in a temporary directory so that whoever finds a modified source
+# file finds the undo for it in the same place, and so that it cannot be swept
+# away by a cleaner while a mutation is live.
+SIDECAR = ROOT / ".mutation-in-progress.json"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +107,14 @@ MUTATIONS: list[Mutation] = [
         new="if false {",
         rule="A process retires after an indeterminate operation. Letting it continue asserts an ordering the client had no way to know.",
         packages=("./internal/history/...",),
+    ),
+    Mutation(
+        ident="H05",
+        path="internal/history/history.go",
+        old="\t\t\tif instants[at] {",
+        new="\t\t\tif false {",
+        rule="Two zero-width operations on one key at one instant are refused. Each completes at or before the other is invoked, so no order respects real time - and the entry list cannot express that, so the search picks one and reports a pass.",
+        packages=("./internal/history/...", "./internal/checker/..."),
     ),
     Mutation(
         ident="M01",
@@ -202,6 +226,14 @@ MUTATIONS: list[Mutation] = [
         packages=("./internal/checker/...",),
     ),
     Mutation(
+        ident="C08",
+        path="internal/checker/checker.go",
+        old="\t\tif opt.MaxCacheBytes > 0 && seen.Bytes() >= opt.MaxCacheBytes {",
+        new="\t\tif false {",
+        rule="The search stops when it has remembered too much. The visit budget counts transitions, not bytes, so without this a large history reaches it having already taken gigabytes - measured at 4.96 GB from a twelve-megabyte file.",
+        packages=("./internal/checker/...",),
+    ),
+    Mutation(
         ident="C05",
         path="internal/checker/checker.go",
         old="\t\tif op.Complete >= t {\n\t\t\top.Outcome = history.Info",
@@ -268,8 +300,59 @@ def write_source(path: Path, text: str) -> None:
         fh.write(text)
 
 
+def write_sidecar(m: Mutation, original: str) -> None:
+    """Record what is about to be mutated, and what it used to say.
+
+    Through a temporary file and os.replace, because a sidecar that was itself
+    half written when the process died would be worth no more than none at all,
+    and the next run would refuse to continue over it.
+    """
+    tmp = SIDECAR.parent / (SIDECAR.name + ".tmp")
+    write_source(tmp, json.dumps({"mutation": m.ident, "path": m.path, "original": original}))
+    os.replace(tmp, SIDECAR)
+
+
+def clear_sidecar() -> None:
+    """Drop the record, once the file it describes is back as it was."""
+    SIDECAR.unlink(missing_ok=True)
+
+
+def recover() -> None:
+    """Put back a mutant left on disk by a run that was killed.
+
+    Loud, and before anything else runs: a surviving mutant is a source file
+    that quietly says something false, and the worst of them turns an exhausted
+    search into a pass.
+    """
+    if not SIDECAR.exists():
+        return
+    try:
+        record = json.loads(read_source(SIDECAR))
+        ident, path, original = record["mutation"], record["path"], record["original"]
+    except (ValueError, KeyError) as err:
+        raise SystemExit(
+            f"mutations: {SIDECAR.name} cannot be read ({err}), and it is the only record of "
+            f"what a killed run was in the middle of changing. Check `git status`, put the file "
+            f"back by hand, then delete {SIDECAR.name}."
+        )
+
+    target = ROOT / path
+    if target.exists() and read_source(target) == original:
+        print(f"mutations: {SIDECAR.name} was left behind by mutation {ident}, but {path} already "
+              f"matches the original, so there was nothing to undo.")
+    else:
+        write_source(target, original)
+        print(f"mutations: RECOVERED. A previous run was killed with mutation {ident} applied to "
+              f"{path}; the file has been restored from {SIDECAR.name}.")
+    clear_sidecar()
+
+
 def apply_mutation(m: Mutation) -> str:
-    """Write the mutant and return the original text, held in memory."""
+    """Write the mutant and return the original text, held in memory.
+
+    The sidecar is written first, so there is no instant at which a mutated
+    file exists with nothing on disk saying what it used to be.
+    """
     original = read_source(m.file)
     count = original.count(m.old)
     if count != 1:
@@ -279,6 +362,7 @@ def apply_mutation(m: Mutation) -> str:
             f"A replacement that matches nothing produces a mutant identical to the "
             f"original, and the report would then blame the tests."
         )
+    write_sidecar(m, original)
     write_source(m.file, original.replace(m.old, m.new))
     return original
 
@@ -289,6 +373,10 @@ def main() -> int:
     ap.add_argument("--only", help="run a single mutation by identifier")
     ap.add_argument("--no-write", action="store_true", help="do not rewrite MUTATIONS.md")
     args = ap.parse_args()
+
+    # Before the listing, before the baseline, before anything reads a source
+    # file: whatever the last run left behind is undone first.
+    recover()
 
     if args.list:
         for m in MUTATIONS:
@@ -325,6 +413,7 @@ def main() -> int:
             elapsed = time.time() - started
         finally:
             write_source(m.file, original)
+            clear_sidecar()
 
         if passed:
             print(f"SURVIVED ({elapsed:.1f}s)")

@@ -81,3 +81,62 @@ func TestGenerateReturnsOnEveryAcceptedDomain(t *testing.T) {
 		t.Fatal("generate did not return: the to != from retry loop cannot terminate on a domain Run accepts")
 	}
 }
+
+func TestRunRefusesFewerClientsThanNodes(t *testing.T) {
+	// Clients are spread round-robin, so fewer clients than nodes leaves a node
+	// with nobody talking to it. A partition then cuts hops that were carrying
+	// nothing, the byte counters still look healthy because one seed's client
+	// blip contributes, and the run returns a clean verdict about a network
+	// that was never meaningfully broken. Measured at one client over three
+	// nodes: five clean seeds in which both followers answered four requests
+	// each, all of them after the heal.
+	topo, err := BuildTopology(deadAddrs(3), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer topo.Close()
+
+	_, err = Run(t.Context(), topo, Config{
+		Clients:  1,
+		Keys:     2,
+		Duration: 2 * time.Second,
+		Faults:   "partition",
+		Seed:     1,
+	})
+	if err == nil {
+		t.Fatal("Run accepted one client across three nodes; two of them would never be asked anything")
+	}
+	if !strings.Contains(err.Error(), "at least one per node") {
+		t.Fatalf("Run refused it as %q, which does not tell the caller what to change", err)
+	}
+}
+
+func TestRunAcceptsExactlyOneClientPerNode(t *testing.T) {
+	// The guard must not be off by one: three clients over three nodes is the
+	// smallest configuration in which every node is observed, and it has to be
+	// allowed or the harness refuses its own minimum.
+	topo, err := BuildTopology(deadAddrs(3), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer topo.Close()
+
+	// Nothing is listening behind those addresses, so every operation comes
+	// back indeterminate. That is a fine run with a boring history, and the
+	// point here is only that the configuration was not refused.
+	res, err := Run(t.Context(), topo, Config{
+		Clients:   3,
+		Keys:      1,
+		Duration:  700 * time.Millisecond,
+		OpTimeout: 50 * time.Millisecond,
+		Faults:    "none",
+		Seed:      1,
+		Quiesce:   50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Run refused one client per node: %v", err)
+	}
+	if len(res.History) == 0 {
+		t.Fatal("the run recorded nothing at all")
+	}
+}

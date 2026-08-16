@@ -237,7 +237,7 @@ func PartitionSchedule(t *Topology, seed int64, d time.Duration, f faultnet.Faul
 		now += cutFor + jitter(rng, 200*time.Millisecond, 900*time.Millisecond)
 	}
 	events = append(events, t.HealEvents(d-tail)...)
-	return faultnet.NewSchedule(names, d, events)
+	return faultnet.NewNamedSchedule("partition", seed, names, d, events)
 }
 
 // singleNodeSchedule blips the one client link of a single-node target.
@@ -254,7 +254,7 @@ func singleNodeSchedule(names []string, seed int64, d time.Duration, f faultnet.
 		now += cutFor + jitter(rng, 200*time.Millisecond, 900*time.Millisecond)
 	}
 	events = append(events, faultnet.Event{At: d - (d / 8), Link: names[0], Fault: faultnet.Pass})
-	return faultnet.NewSchedule(names, d, events)
+	return faultnet.NewNamedSchedule("partition", seed, names, d, events)
 }
 
 // randomProperSubset picks a non-empty subset of [0,n) that is not all of it.
