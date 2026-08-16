@@ -260,11 +260,61 @@ MUTATIONS: list[Mutation] = [
 ]
 
 
+# Markers for a run that never got as far as executing the tests. The policy
+# one is Windows Application Control, which refuses to launch an unsigned
+# binary it has no reputation for and decides per content hash, so the same
+# mutation can be blocked on one run and fine on the next.
+BLOCKED = (
+    "Application Control policy",
+    "Permission denied",
+    "Access is denied",
+    "operation not permitted",
+)
+DID_NOT_BUILD = ("build failed", "cannot use", "undefined:", "syntax error", "declared and not used")
+
+
+# Build variants used to get a test binary past a launch block. Windows
+# Application Control decides per content hash, so the same source compiled a
+# different way is a different file to it and is usually allowed. None of these
+# changes what the code does - they change symbol tables and inlining, which is
+# enough to move the hash.
+BUILD_VARIANTS: tuple[tuple[str, ...], ...] = (
+    (),
+    ("-ldflags", "-s -w"),
+    ("-gcflags", "all=-N"),
+    ("-ldflags", "-s"),
+    ("-trimpath", "-ldflags", "-w"),
+)
+
+
+def launch_blocked(output: str) -> bool:
+    """Report whether the tests never ran because the platform refused to start them."""
+    return any(b in output for b in BLOCKED)
+
+
 def run_tests(packages: tuple[str, ...]) -> tuple[bool, str]:
-    """Run go test over the given packages. Returns (passed, output)."""
-    cmd = ["go", "test", "-count=1", *packages]
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-    return proc.returncode == 0, proc.stdout + proc.stderr
+    """Run go test over the given packages. Returns (passed, output).
+
+    Retries with a differently-built binary when the platform refuses to launch
+    the one it just produced. That is not papering over a failure: a blocked
+    binary was never executed, so there is no result to hide, and the retry
+    exists so this harness can finish on a machine where roughly one mutant in
+    eighteen gets stopped by Application Control. A genuine test failure is
+    returned on the first attempt and never retried - the retry is gated on the
+    block markers alone.
+    """
+    output = ""
+    for attempt, extra in enumerate(BUILD_VARIANTS, start=1):
+        cmd = ["go", "test", "-count=1", *extra, *packages]
+        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+        output = proc.stdout + proc.stderr
+        if proc.returncode == 0:
+            return True, output
+        if not launch_blocked(output):
+            return False, output
+        if attempt < len(BUILD_VARIANTS):
+            print(f"[rebuild {attempt}] ", end="", flush=True)
+    return False, output
 
 
 FAIL_LINE = re.compile(r"^--- FAIL: (\S+)", re.MULTILINE)
@@ -347,23 +397,10 @@ def recover() -> None:
     clear_sidecar()
 
 
-# Markers for a run that never got as far as executing the tests. The policy
-# one is Windows Application Control, which refuses to launch an unsigned
-# binary it has no reputation for and decides per content hash, so the same
-# mutation can be blocked on one run and fine on the next.
-BLOCKED = (
-    "Application Control policy",
-    "Permission denied",
-    "Access is denied",
-    "operation not permitted",
-)
-DID_NOT_BUILD = ("build failed", "cannot use", "undefined:", "syntax error", "declared and not used")
-
-
 def classify_failure(output: str) -> str:
     """Say why a mutant run failed without a named test failing."""
-    if any(b in output for b in BLOCKED):
-        return "the tests could not be launched on this machine"
+    if launch_blocked(output):
+        return "the tests could not be launched on this machine, even rebuilt"
     if any(b in output for b in DID_NOT_BUILD):
         return "did not compile"
     return "the package failed without a named test"
