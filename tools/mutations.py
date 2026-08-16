@@ -499,9 +499,12 @@ def write_evidence(rows) -> None:
         "| --- | --- | --- | --- |",
     ]
     for m, killers in rows:
+        # Only the killing test is recorded, deliberately. How many OTHER tests
+        # the mutant also took down is scheduling noise: CI computed 16 and 17
+        # for the same mutation on consecutive runs of the same commit, which
+        # made this file fail its own diff for a reason that says nothing about
+        # whether the rule is pinned. One named test dying is the evidence.
         shown = killers[0]
-        if len(killers) > 1:
-            shown += f" (+{len(killers) - 1} more)"
         lines.append(f"| {m.ident} | `{m.path}` | {m.rule} | `{shown}` |")
     lines.append("")
     write_source(EVIDENCE, "\n".join(lines) + "\n")
