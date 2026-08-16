@@ -20,7 +20,10 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Leo-Y-Zhang/Splitbrain/internal/history"
@@ -81,6 +84,19 @@ type Options struct {
 	// Minimize asks for the smallest failing truncation of the history when a
 	// violation is found. It costs a handful of extra searches.
 	Minimize bool
+
+	// Parallelism is how many keys Check may search at once. Zero means
+	// runtime.GOMAXPROCS(0); one is sequential. It never exceeds the number of
+	// keys, so a two-key history does not start eight goroutines to sit idle.
+	//
+	// It cannot change a verdict. Keys are independent objects and
+	// linearizability is compositional over them, which is the same argument
+	// that lets Check split the history by key in the first place; searching
+	// two of them at the same time is the same question asked twice, not an
+	// approximation. What it does change is that Model.Step is called from
+	// several goroutines at once, so a Model must be safe for concurrent use.
+	// Every model in this repository is a stateless empty struct.
+	Parallelism int
 }
 
 // KeyStat is what happened on one key.
@@ -150,44 +166,109 @@ func Check(h history.History, m model.Model, opt Options) (Result, error) {
 		deadline = start.Add(opt.Timeout)
 	}
 
+	// One slot per key, in sorted key order, filled by whichever goroutine took
+	// that key. Nothing is shared for writing, so there is nothing to lock and
+	// nothing for the race detector to find - and, more to the point, nothing
+	// about the answer depends on which key finished first. A shared map behind
+	// a mutex would be safe and still wrong: it would hand "which key failed"
+	// to the scheduler, and two runs over the same file would disagree.
+	results := make([]keyResult, len(keys))
+	searchAll(keys, byKey, results, m, opt, deadline)
+
 	perKey := make(map[string]KeyStat, len(keys))
-	results := make(map[string]keyResult, len(keys))
 	total := 0
-	for _, k := range keys {
-		ops := byKey[k]
-		// Sorting makes the search independent of the order operations happen
-		// to sit in the input slice, which history says carries no meaning.
-		ops.SortByInvoke()
-		kr := searchKey(ops, m, opt, deadline)
-		results[k] = kr
-		perKey[k] = KeyStat{Ops: len(ops), Visits: kr.visits, Verdict: kr.verdict, Elapsed: kr.elapsed}
+	for i, k := range keys {
+		kr := results[i]
+		perKey[k] = KeyStat{Ops: len(byKey[k]), Visits: kr.visits, Verdict: kr.verdict, Elapsed: kr.elapsed}
 		total += kr.visits
 	}
 
 	res := Result{Verdict: Linearizable, Visits: total, PerKey: perKey}
 	res.Reason = summarise(len(live), len(keys))
 
-	reported := ""
+	reported := -1
 	for _, want := range []Verdict{NotLinearizable, Unknown} {
-		for _, k := range keys {
-			if results[k].verdict == want {
-				reported, res.Verdict = k, want
+		for i := range keys {
+			if results[i].verdict == want {
+				reported, res.Verdict = i, want
 				break
 			}
 		}
-		if reported != "" {
+		if reported >= 0 {
 			break
 		}
 	}
 
-	if reported != "" {
+	if reported >= 0 {
+		k := keys[reported]
 		kr := results[reported]
-		res.Key = reported
-		res.Reason = fmt.Sprintf("key %q: %s", reported, kr.reason)
-		res.attachDetail(byKey[reported], kr, m, opt, deadline)
+		res.Key = k
+		res.Reason = fmt.Sprintf("key %q: %s", k, kr.reason)
+		res.attachDetail(byKey[k], kr, m, opt, deadline)
 	}
 	res.Elapsed = time.Since(start)
 	return res, nil
+}
+
+// searchAll searches every key, writing each key's outcome into its own slot of
+// results, and returns once all of them are done.
+//
+// Keys are independent objects, so this is exact rather than an approximation:
+// it is the compositional argument that lets Check split the history by key at
+// all, applied to when the searches run rather than to whether they are
+// separate. Each goroutine touches one key's operations and one slot; byKey and
+// keys are only read.
+//
+// Options.Timeout is deliberately not divided up. It bounds the call, so every
+// key races the same deadline; MaxVisits and MaxCacheBytes are per key and stay
+// per key, which means the memory ceiling is now per key in flight rather than
+// per key in turn.
+func searchAll(keys []string, byKey map[string]history.History, results []keyResult,
+	m model.Model, opt Options, deadline time.Time) {
+
+	workers := opt.Parallelism
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	if workers > len(keys) {
+		workers = len(keys)
+	}
+	if workers <= 1 {
+		for i, k := range keys {
+			results[i] = searchOne(byKey[k], m, opt, deadline)
+		}
+		return
+	}
+
+	// Keys cost wildly different amounts - on a captured run one key took 515
+	// model transitions and another took two million - so the work is handed
+	// out as it is asked for rather than dealt out in advance.
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(keys) {
+					return
+				}
+				results[i] = searchOne(byKey[keys[i]], m, opt, deadline)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// searchOne sorts one key's operations and searches them.
+//
+// The sort belongs here, with the search, because it makes the answer
+// independent of the order the operations happen to sit in the input slice,
+// which history says carries no meaning.
+func searchOne(ops history.History, m model.Model, opt Options, deadline time.Time) keyResult {
+	ops.SortByInvoke()
+	return searchKey(ops, m, opt, deadline)
 }
 
 // CheckKey decides whether one key's operations are linearizable.
@@ -287,6 +368,10 @@ type keyResult struct {
 	// search may have failed for several reasons at that depth.
 	culprit    history.Op
 	hasCulprit bool
+
+	// finalState is the model state the linearization ends in. It is only
+	// meaningful when verdict is Linearizable, and only indeterminateLast reads it.
+	finalState model.State
 }
 
 // An entry is one endpoint of an operation on the timeline: the moment the
@@ -472,13 +557,140 @@ func (c *cache) add(lin bitset, s model.State) {
 // either side of a timeout does not matter.
 const deadlineCheckEvery = 4096
 
-// searchKey runs the Wing-Gong search over one key's operations, which must
-// already be sorted by invocation time.
+// indeterminateLastVisits is the transition budget the fast path below is
+// allowed, per operation on the key. It is small on purpose: the fast path
+// either succeeds almost immediately or is the wrong shape for this history,
+// and every transition it spends comes off the budget for the real search, so
+// the ceiling the caller asked for is the ceiling they get.
+//
+// Measured: where the fast path works it takes a shade over one transition per
+// operation - 515 for a 505-operation key. Thirty-two is a wide margin over
+// that and still under one per cent of the command line's default budget for a
+// key that size.
+const indeterminateLastVisits = 32
+
+// searchKey decides one key's operations, which must already be sorted by
+// invocation time.
+//
+// It tries a cheap special case first, then the general search. See
+// indeterminateLast for the special case and searchFull for the search.
 func searchKey(ops history.History, m model.Model, opt Options, deadline time.Time) keyResult {
+	start := time.Now()
+	if len(ops) == 0 {
+		return keyResult{
+			verdict: Linearizable,
+			reason:  fmt.Sprintf("all %s on this key linearize", plural(0, "operation")),
+			elapsed: time.Since(start),
+		}
+	}
+
+	found, spent := indeterminateLast(ops, m, opt, deadline)
+	if found {
+		return keyResult{
+			verdict: Linearizable,
+			reason:  fmt.Sprintf("all %s on this key linearize", plural(len(ops), "operation")),
+			visits:  spent,
+			elapsed: time.Since(start),
+		}
+	}
+	rest := opt
+	if opt.MaxVisits > 0 {
+		if spent >= opt.MaxVisits {
+			// The fast path used the lot. Handing the real search a remaining
+			// budget of zero would read as "unlimited", which is the one thing
+			// it must never mean.
+			return keyResult{
+				verdict: Unknown,
+				reason:  fmt.Sprintf("undecided after %d model transitions, the visit budget", spent),
+				visits:  spent,
+				elapsed: time.Since(start),
+			}
+		}
+		rest.MaxVisits = opt.MaxVisits - spent
+	}
+	kr := searchFull(ops, m, rest, deadline)
+	kr.visits += spent
+	kr.elapsed = time.Since(start)
+	return kr
+}
+
+// indeterminateLast looks for one particular shape of linearization: every operation
+// the client never heard back from placed after every operation that returned.
+// It reports whether it found one, and what it spent finding out.
+//
+// It can only ever answer yes. Failing to find this shape says nothing at all
+// about the history - a linearization may exist with a timed-out write in the
+// middle - so a failure falls through to the full search and never becomes a
+// verdict. That one-sidedness is what makes it safe to give up on early.
+//
+// When it answers yes it has a witness, so the answer is exact. The ordering is
+// legal in real time by construction: an operation that never returned has no
+// completion time, so nothing is required to follow it, and putting all of them
+// at the end cannot violate a constraint that does not exist. The operations
+// that did return keep the order the search found for them among themselves.
+//
+// This is worth the code because it is what a real run produces. On a captured
+// 4008-operation kvsingle run under `-faults chaos`, not one successful read
+// observed a value only an indeterminate operation could have explained: zero,
+// across eight keys carrying 42 to 60 such operations each. Those operations
+// therefore all belong at the end, and finding that costs a walk. Searching for
+// it in the general way instead spent the whole two-million transition budget
+// on five of the eight keys and reported unknown, because an operation that
+// never returns is a candidate at every node and always fits a register model,
+// so the search tries each of them at every step.
+//
+// The indeterminate operations are appended in invocation order, which is the
+// order the requests were sent in and so the order a server that applied them
+// late would have applied them. If the model refuses one of them in that order
+// the fast path gives up rather than searching their permutations.
+func indeterminateLast(ops history.History, m model.Model, opt Options, deadline time.Time) (bool, int) {
+	// Classify by outcome rather than by completion time. They agree on any
+	// history Validate accepted, but Outcome is the thing being reasoned about.
+	returned := make(history.History, 0, len(ops))
+	var indeterminate history.History
+	for _, op := range ops {
+		if op.Outcome == history.Info {
+			indeterminate = append(indeterminate, op)
+		} else {
+			returned = append(returned, op)
+		}
+	}
+	if len(indeterminate) == 0 {
+		// Nothing to move to the end, so this is just the full search again.
+		return false, 0
+	}
+
+	probe := opt
+	probe.MaxVisits = indeterminateLastVisits * len(ops)
+	if opt.MaxVisits > 0 && opt.MaxVisits < probe.MaxVisits {
+		probe.MaxVisits = opt.MaxVisits
+	}
+	kr := searchFull(returned, m, probe, deadline)
+	if kr.verdict != Linearizable {
+		return false, kr.visits
+	}
+
+	state := kr.finalState
+	visits := kr.visits
+	for _, op := range indeterminate {
+		next, ok := m.Step(state, op)
+		visits++
+		if !ok {
+			return false, visits
+		}
+		state = next
+	}
+	return true, visits
+}
+
+// searchFull runs the Wing-Gong search over one key's operations, which must
+// already be sorted by invocation time.
+func searchFull(ops history.History, m model.Model, opt Options, deadline time.Time) keyResult {
 	start := time.Now()
 	kr := keyResult{verdict: Linearizable}
 	kr.reason = fmt.Sprintf("all %s on this key linearize", plural(len(ops), "operation"))
 	if len(ops) == 0 {
+		kr.finalState = m.Init()
 		kr.elapsed = time.Since(start)
 		return kr
 	}
@@ -581,6 +793,11 @@ func searchKey(ops history.History, m model.Model, opt Options, deadline time.Ti
 
 	if bestOp != nil && kr.verdict != Linearizable {
 		kr.culprit, kr.hasCulprit = *bestOp, true
+	}
+	if kr.verdict == Linearizable {
+		// Every operation is placed, so this is the state the linearization
+		// ends in. indeterminateLast continues from here.
+		kr.finalState = state
 	}
 	kr.visits = visits
 	kr.elapsed = time.Since(start)
