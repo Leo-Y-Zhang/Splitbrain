@@ -64,7 +64,7 @@ func TestGenerateReturnsOnEveryAcceptedDomain(t *testing.T) {
 		defer close(done)
 		rng := rand.New(rand.NewPCG(1, 2))
 		keys := []string{"k0", "k1"}
-		for _, valueMax := range []int{minValueMax, 3, 10} {
+		for _, valueMax := range []int{MinValueMax, 3, 10} {
 			// Seed the client's beliefs with every value in the domain, which is
 			// what puts `from` on a collision course with `to`.
 			for believedValue := 0; believedValue <= valueMax; believedValue++ {
@@ -138,5 +138,155 @@ func TestRunAcceptsExactlyOneClientPerNode(t *testing.T) {
 	}
 	if len(res.History) == 0 {
 		t.Fatal("the run recorded nothing at all")
+	}
+}
+
+// TestWithDefaultsLeavesAnImpossibleValueAlone pins the distinction the rest of
+// this fix rests on.
+//
+// A blank field means "choose for me", and WithDefaults chooses. A negative one
+// is a value somebody typed, and no default it could substitute is what they
+// asked for. WithDefaults used to treat everything <= 0 as blank, so
+// `-duration -5s` ran for eight seconds under a banner that echoed -5s back at
+// the person who typed it. Keeping the negative here is what lets Validate say
+// so a line later.
+func TestWithDefaultsLeavesAnImpossibleValueAlone(t *testing.T) {
+	c := Config{
+		Clients:   -1,
+		Keys:      -1,
+		Duration:  -5 * time.Second,
+		OpTimeout: -400 * time.Millisecond,
+		ThinkMax:  -3 * time.Second,
+		Quiesce:   -time.Second,
+		ValueMax:  -2,
+		MaxOps:    -1,
+	}.WithDefaults()
+
+	for _, f := range []struct {
+		name string
+		got  int64
+		want int64
+	}{
+		{"Clients", int64(c.Clients), -1},
+		{"Keys", int64(c.Keys), -1},
+		{"Duration", int64(c.Duration), int64(-5 * time.Second)},
+		{"OpTimeout", int64(c.OpTimeout), int64(-400 * time.Millisecond)},
+		{"ThinkMax", int64(c.ThinkMax), int64(-3 * time.Second)},
+		{"Quiesce", int64(c.Quiesce), int64(-time.Second)},
+		{"ValueMax", int64(c.ValueMax), -2},
+		{"MaxOps", int64(c.MaxOps), -1},
+	} {
+		if f.got != f.want {
+			t.Errorf("WithDefaults replaced %s = %d with %d; the caller asked for something impossible and is entitled to be told, not overruled",
+				f.name, f.want, f.got)
+		}
+	}
+}
+
+// TestValidateRefusesWhatNoCallerCanMean walks every value Validate exists to
+// catch, and checks that Run refuses it in the same words rather than running
+// something else.
+func TestValidateRefusesWhatNoCallerCanMean(t *testing.T) {
+	base := Config{
+		Clients:   1,
+		Keys:      1,
+		Duration:  time.Second,
+		OpTimeout: 50 * time.Millisecond,
+		ValueMax:  8,
+		Faults:    "none",
+		Quiesce:   time.Millisecond,
+	}
+	// If the base were already invalid the table below would pass for the
+	// wrong reason, so it is checked first.
+	if err := base.Validate(); err != nil {
+		t.Fatalf("the base configuration of this test is itself refused: %v", err)
+	}
+
+	// One node, and nothing listening behind it. No case here gets far enough
+	// to dial anything.
+	topo, err := BuildTopology([]string{"127.0.0.1:9"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer topo.Close()
+
+	cases := []struct {
+		name   string
+		impose func(*Config)
+	}{
+		{"duration", func(c *Config) { c.Duration = -5 * time.Second }},
+		{"op-timeout", func(c *Config) { c.OpTimeout = -time.Millisecond }},
+		{"think", func(c *Config) { c.ThinkMax = -3 * time.Second }},
+		{"quiesce", func(c *Config) { c.Quiesce = -time.Second }},
+		{"clients", func(c *Config) { c.Clients = -1 }},
+		{"keys", func(c *Config) { c.Keys = -1 }},
+		{"value-max", func(c *Config) { c.ValueMax = 1 }},
+		{"max-ops", func(c *Config) { c.MaxOps = -1 }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := base
+			c.impose(&cfg)
+
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted a %s no caller can have meant", c.name)
+			}
+			// Naming the field is the point. A refusal that does not say which
+			// value was wrong is barely better than the silent substitution it
+			// replaced.
+			if !strings.Contains(err.Error(), c.name) {
+				t.Fatalf("Validate refused it as %q, which never names %s", err, c.name)
+			}
+
+			_, runErr := Run(t.Context(), topo, cfg)
+			if runErr == nil {
+				t.Fatalf("Run accepted what Validate refused (%v)", err)
+			}
+			if runErr.Error() != err.Error() {
+				t.Fatalf("Run refused it as %q; Validate says %q, and a caller reading the second should recognise the first", runErr, err)
+			}
+		})
+	}
+}
+
+// TestABlankConfigIsStillAWorkingOne is the library caller's side of the
+// bargain. Config{} means "choose everything for me", and it has to keep
+// meaning that: the fix is about values somebody chose, not about making
+// callers spell out fields they never cared about.
+func TestABlankConfigIsStillAWorkingOne(t *testing.T) {
+	c := Config{}.WithDefaults()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a blank configuration came out of WithDefaults invalid: %v", err)
+	}
+	// The pauses especially. Honouring an explicit zero must not turn every
+	// default run into a hot loop with no settling period before the final
+	// reads - which are the most informative operations in the history.
+	if c.ThinkMax <= 0 {
+		t.Error("a blank ThinkMax was left at zero; clients would never pause and intervals would stop overlapping")
+	}
+	if c.Quiesce <= 0 {
+		t.Error("a blank Quiesce was left at zero; the run would have no uncontended final reads")
+	}
+}
+
+// TestAnExplicitZeroPauseSurvivesDefaults is the other half: a caller who does
+// mean zero gets zero. This is the case a careless fix breaks, because zero is
+// also what a blank field looks like.
+func TestAnExplicitZeroPauseSurvivesDefaults(t *testing.T) {
+	c := Config{ThinkMaxSet: true, QuiesceSet: true}.WithDefaults()
+	if c.ThinkMax != 0 {
+		t.Errorf("ThinkMax = %s; the caller said zero and was given a default instead", c.ThinkMax)
+	}
+	if c.Quiesce != 0 {
+		t.Errorf("Quiesce = %s; the caller said zero and was given a default instead", c.Quiesce)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("no pause and no settling time is a legitimate run, but Validate refused it: %v", err)
+	}
+	// Saying "I mean zero" about the pauses must not stop anything else being
+	// filled in.
+	if c.Clients < 1 || c.Keys < 1 || c.Duration <= 0 || c.OpTimeout <= 0 {
+		t.Errorf("the rest of the configuration was left blank: %+v", c)
 	}
 }

@@ -149,6 +149,22 @@ MUTATIONS: list[Mutation] = [
         packages=("./internal/model/...",),
     ),
     Mutation(
+        ident="V01",
+        path="internal/harness/harness.go",
+        old="\tif c.Duration == 0 {",
+        new="\tif c.Duration <= 0 {",
+        rule="A zero field means \"choose for me\"; a negative one means the caller asked for something impossible. Widening this back to <= silently replaces -5s with the default while the banner still echoes -5s.",
+        packages=("./internal/harness/...", "./cmd/..."),
+    ),
+    Mutation(
+        ident="V02",
+        path="internal/harness/harness.go",
+        old="\tif c.ThinkMax == 0 && !c.ThinkMaxSet {",
+        new="\tif c.ThinkMax == 0 {",
+        rule="An explicitly requested zero pause is honoured, not defaulted. Without the marker there is no way to say \"I mean zero\", because a zero pause and an unspecified one are the same bits.",
+        packages=("./internal/harness/...", "./cmd/..."),
+    ),
+    Mutation(
         ident="K01",
         path="internal/clock/clock.go",
         old="	return measured + c.granularity",

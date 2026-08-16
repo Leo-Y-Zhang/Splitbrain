@@ -130,6 +130,13 @@ type runFlags struct {
 	checkTmo  time.Duration
 	expect    string
 	verbose   bool
+
+	// typed names the flags the user actually wrote, which is the one thing
+	// the values themselves cannot say. -think 8ms and no -think at all have
+	// to behave identically; -think 0 has to be obeyed; -duration -5s has to
+	// be refused rather than quietly replaced. Only flag.FlagSet knows which
+	// of those happened, so parse asks it and writes the answer down here.
+	typed map[string]bool
 }
 
 func (f *runFlags) register(fs *flag.FlagSet) {
@@ -156,6 +163,67 @@ func (f *runFlags) register(fs *flag.FlagSet) {
 	fs.BoolVar(&f.verbose, "v", false, "print the fault timeline and per-link traffic")
 }
 
+// parse reads args into f, records which flags were typed, and refuses the ones
+// the harness could not honour.
+//
+// Both halves matter. Without the record, a pause of zero is indistinguishable
+// from a pause left unspecified, and the harness fills the blank it thinks it
+// sees. Without the refusal, a value the harness cannot use is replaced by a
+// default and the run reports on a configuration nobody asked for.
+func (f *runFlags) parse(fs *flag.FlagSet, args []string) error {
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	f.typed = make(map[string]bool)
+	fs.Visit(func(fl *flag.Flag) { f.typed[fl.Name] = true })
+	return f.validate()
+}
+
+// validate refuses a flag the user typed whose value cannot mean anything.
+//
+// Only typed flags are judged. Every default here is serviceable, so a
+// complaint about a value nobody chose would be baffling, and the check would
+// be about this file rather than about what the user asked for.
+//
+// The message names the flag and says what would be acceptable: "invalid value"
+// leaves the reader to work out which of a dozen flags is at fault, and the
+// whole point of refusing is to be more use than a silent substitution was.
+func (f *runFlags) validate() error {
+	checks := []struct {
+		name string // flag name, without its dash
+		ok   bool   // whether the value can mean anything
+		got  string // what it was set to
+		want string // what would be acceptable, and why
+	}{
+		{"clients", f.clients >= 1, strconv.Itoa(f.clients),
+			"a run needs at least one client, or nothing issues an operation and the history is empty"},
+		{"keys", f.keys >= 1, strconv.Itoa(f.keys),
+			"a run needs at least one register for the clients to share"},
+		{"duration", f.duration > 0, f.duration.String(),
+			"a run has to last a positive time"},
+		{"op-timeout", f.opTimeout > 0, f.opTimeout.String(),
+			"an operation needs a positive timeout, and one well short of -duration"},
+		{"value-max", f.valueMax >= harness.MinValueMax, strconv.Itoa(f.valueMax),
+			fmt.Sprintf("it must be at least %d, because a compare-and-swap needs two different values to move between", harness.MinValueMax)},
+		{"max-ops", f.maxOps >= 0, strconv.Itoa(f.maxOps),
+			"give a positive number of operations, or 0 for no cap"},
+		{"think", f.thinkMax >= 0, f.thinkMax.String(),
+			"a pause cannot be negative; 0 is allowed and means no pause at all"},
+		{"quiesce", f.quiesce >= 0, f.quiesce.String(),
+			"a settling time cannot be negative; 0 is allowed and means the final reads start at once"},
+	}
+	// Only the first offender is reported, and which one that is depends on
+	// the order of this list rather than on the order they were typed, so the
+	// same command line always produces the same message. The rest are still
+	// waiting on the next attempt.
+	for _, c := range checks {
+		if f.typed[c.name] && !c.ok {
+			return fmt.Errorf("-%s %s: %s", c.name, c.got, c.want)
+		}
+	}
+	return nil
+}
+
 func (f *runFlags) harnessConfig(seed int64) harness.Config {
 	return harness.Config{
 		Clients:   f.clients,
@@ -164,11 +232,16 @@ func (f *runFlags) harnessConfig(seed int64) harness.Config {
 		MaxOps:    f.maxOps,
 		OpTimeout: f.opTimeout,
 		ThinkMax:  f.thinkMax,
-		ValueMax:  f.valueMax,
-		Faults:    f.faults,
-		Seed:      seed,
-		Quiesce:   f.quiesce,
-		KeepAlive: f.keepAlive,
+		// A pause the user asked for is passed on as one they asked for, zero
+		// included, or the harness would read that zero as a blank and choose
+		// its own eight milliseconds.
+		ThinkMaxSet: f.typed["think"],
+		ValueMax:    f.valueMax,
+		Faults:      f.faults,
+		Seed:        seed,
+		Quiesce:     f.quiesce,
+		QuiesceSet:  f.typed["quiesce"],
+		KeepAlive:   f.keepAlive,
 	}
 }
 
@@ -245,7 +318,9 @@ func cmdRun(ctx context.Context, args []string) error {
 	reportPath := fs.String("report", "", "write a self-contained HTML report here")
 	counterPath := fs.String("counterexample", "", "write the minimal failing truncation here as JSON Lines")
 	seed := fs.Int64("seed", 1, "seed for the fault schedule and the operation generator")
-	if err := fs.Parse(args); err != nil {
+	// Before the banner, deliberately: a banner that echoes a value the run is
+	// about to replace is worse than no banner at all.
+	if err := f.parse(fs, args); err != nil {
 		return err
 	}
 
@@ -377,7 +452,7 @@ func cmdSweep(ctx context.Context, args []string) error {
 	f.register(fs)
 	seedsArg := fs.String("seeds", "0-9", "inclusive seed range, for example 0-49")
 	stopEarly := fs.Bool("stop-on-mismatch", false, "stop at the first seed that contradicts -expect")
-	if err := fs.Parse(args); err != nil {
+	if err := f.parse(fs, args); err != nil {
 		return err
 	}
 	lo, hi, err := parseRange(*seedsArg)

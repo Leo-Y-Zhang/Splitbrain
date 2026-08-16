@@ -58,10 +58,18 @@ type Config struct {
 	// overlapping intervals are the only reason the checker has work to do.
 	ThinkMax time.Duration
 
+	// ThinkMaxSet says ThinkMax means what it says, zero included. Nothing
+	// else can express "no pause at all": a blank ThinkMax already means
+	// "choose one for me", so without this a caller who genuinely wants
+	// back-to-back operations - somebody who typed -think 0 - is
+	// indistinguishable from one who did not care, and WithDefaults talks
+	// them out of it.
+	ThinkMaxSet bool
+
 	// ValueMax is the largest value clients write. A small domain makes
 	// coincidental agreement likely and violations hard to see; a large one
 	// makes almost every value unique and almost every read decisive. It must
-	// be at least minValueMax; a domain of one value is not a small domain but
+	// be at least MinValueMax; a domain of one value is not a small domain but
 	// an impossible one.
 	ValueMax int
 
@@ -79,6 +87,14 @@ type Config struct {
 	// excuse it.
 	Quiesce time.Duration
 
+	// QuiesceSet says the same for Quiesce as ThinkMaxSet does for ThinkMax:
+	// zero means run the final reads immediately, rather than "choose a
+	// settling time for me". It is worth having even though the quiescent
+	// phase is the most informative part of a history - a caller timing the
+	// heal itself has a reason to want none of it, and is owed the run they
+	// asked for.
+	QuiesceSet bool
+
 	// KeepAlive lets client connections be reused between operations. Off by
 	// default, because a pooled connection can carry a request straight past
 	// a partition that was applied after it was opened.
@@ -86,32 +102,81 @@ type Config struct {
 }
 
 // WithDefaults fills in the values a caller can reasonably leave blank.
+//
+// Blank means exactly zero. Anything else - a negative duration, a negative
+// count - is not a field somebody left alone but a value somebody chose, and it
+// is left untouched here so that Validate can refuse it by name. Substituting a
+// default for it would run a configuration nobody asked for and say nothing.
 func (c Config) WithDefaults() Config {
-	if c.Clients <= 0 {
+	if c.Clients == 0 {
 		c.Clients = 6
 	}
-	if c.Keys <= 0 {
+	if c.Keys == 0 {
 		c.Keys = 4
 	}
-	if c.Duration <= 0 {
+	if c.Duration == 0 {
 		c.Duration = 8 * time.Second
 	}
-	if c.OpTimeout <= 0 {
+	if c.OpTimeout == 0 {
 		c.OpTimeout = 400 * time.Millisecond
 	}
-	if c.ThinkMax <= 0 {
+	if c.ThinkMax == 0 && !c.ThinkMaxSet {
 		c.ThinkMax = 8 * time.Millisecond
 	}
-	if c.ValueMax <= 0 {
+	if c.ValueMax == 0 {
 		c.ValueMax = 1_000_000
 	}
 	if c.Faults == "" {
 		c.Faults = "partition"
 	}
-	if c.Quiesce <= 0 {
+	if c.Quiesce == 0 && !c.QuiesceSet {
 		c.Quiesce = 750 * time.Millisecond
 	}
 	return c
+}
+
+// Validate reports why this configuration cannot be run, or nil when it can.
+//
+// It exists to draw a line WithDefaults cannot see. A zero field from a library
+// caller means "choose for me", and WithDefaults chooses; the same zero typed
+// on a command line means the user asked for something impossible, and running
+// a different configuration under the name they typed is worse than refusing.
+// So WithDefaults fills blanks and nothing more, and every value that is not
+// blank but cannot mean anything is caught here.
+//
+// It judges a configuration that is ready to run, which is why Run calls it
+// after WithDefaults. On a Config that has not been through WithDefaults it
+// will fairly complain about the blanks.
+func (c Config) Validate() error {
+	// Negative durations are refused whoever set them, defaulted or not: there
+	// is no caller for whom a register settles for minus one second.
+	for _, d := range []struct {
+		name string
+		v    time.Duration
+	}{
+		{"duration", c.Duration},
+		{"op-timeout", c.OpTimeout},
+		{"think", c.ThinkMax},
+		{"quiesce", c.Quiesce},
+	} {
+		if d.v < 0 {
+			return fmt.Errorf("harness: %s is %s; a duration cannot be negative", d.name, d.v)
+		}
+	}
+	if c.Clients < 1 {
+		return fmt.Errorf("harness: clients is %d; there must be at least one, or nothing issues an operation and the history is empty", c.Clients)
+	}
+	if c.Keys < 1 {
+		return fmt.Errorf("harness: keys is %d; there must be at least one register for the clients to share", c.Keys)
+	}
+	if c.ValueMax < MinValueMax {
+		return fmt.Errorf("harness: value-max is %d; it must be at least %d, because a compare-and-swap "+
+			"needs two different values to move between", c.ValueMax, MinValueMax)
+	}
+	if c.MaxOps < 0 {
+		return fmt.Errorf("harness: max-ops is %d; use zero for no cap", c.MaxOps)
+	}
+	return nil
 }
 
 // Result is everything one run produced.
@@ -156,6 +221,14 @@ func Keys(n int) []string {
 // BuildSchedule produces the fault timeline for a run.
 func BuildSchedule(t *Topology, cfg Config) (*faultnet.Schedule, error) {
 	cfg = cfg.WithDefaults()
+	// A negative run length no longer becomes eight seconds here, so without
+	// this it would become an empty timeline instead: the generator lays no
+	// phase that would run past the end of a run that ended before it began.
+	// Printing "0 events" for a duration nobody can have meant is the same
+	// quiet substitution in a different costume.
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	switch cfg.Faults {
 	case "none":
 		return faultnet.Healthy(t.LinkNames(), cfg.Seed, cfg.Duration), nil
@@ -181,12 +254,11 @@ func BuildSchedule(t *Topology, cfg Config) (*faultnet.Schedule, error) {
 // and the outcome counts.
 func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 	cfg = cfg.WithDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if t == nil || t.Nodes() == 0 {
 		return nil, fmt.Errorf("harness: empty topology")
-	}
-	if cfg.ValueMax < minValueMax {
-		return nil, fmt.Errorf("harness: value-max is %d; it must be at least %d, because a compare-and-swap "+
-			"needs two different values to move between", cfg.ValueMax, minValueMax)
 	}
 	if cfg.Clients < t.Nodes() {
 		// Clients are spread round-robin, so fewer clients than nodes leaves
@@ -199,18 +271,6 @@ func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 		return nil, fmt.Errorf("harness: %d client(s) across %d nodes; there must be at least one per node, "+
 			"or a partition cuts hops that were carrying no traffic and the clean verdict means nothing",
 			cfg.Clients, t.Nodes())
-	}
-	if cfg.ValueMax < minValueMax {
-		// Refusing rather than hanging. A compare-and-swap has to move the
-		// register to a different value - a no-op CAS constrains nothing, and
-		// history.Validate rejects one - and generate finds that value by
-		// retrying. On a domain of one value there is nothing to retry towards,
-		// so the loop never ends. It would not end at the start of the run
-		// either, but the first time a client came to believe a key held the
-		// only value there is, at which point the run stops making progress,
-		// ignores Duration, and leaves its node processes behind.
-		return nil, fmt.Errorf("harness: value-max is %d; it must be at least %d, because a compare-and-swap needs two different values to move between",
-			cfg.ValueMax, minValueMax)
 	}
 
 	sched, err := BuildSchedule(t, cfg)
@@ -346,11 +406,14 @@ func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 	}, nil
 }
 
-// minValueMax is the smallest value domain a run can use: a compare-and-swap
+// MinValueMax is the smallest value domain a run can use: a compare-and-swap
 // has to move the register between two different values, and generate finds the
 // second one by retrying, so one value is not a small domain but an impossible
-// one. Run refuses anything below this.
-const minValueMax = 2
+// one. Validate refuses anything below this, because the alternative is not a
+// wrong answer but no answer: the retry spins the first time a client comes to
+// believe a key holds the only value there is, at which point the run stops
+// making progress, ignores Duration, and leaves its node processes behind.
+const MinValueMax = 2
 
 // generate picks the next operation for a client.
 //

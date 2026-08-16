@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"os"
@@ -260,6 +261,98 @@ func TestRenderOpSaysWhatHappened(t *testing.T) {
 	if strings.Contains(pending, "9223372036854775807") || strings.Contains(pending, "2562047h") {
 		t.Errorf("an unanswered operation rendered its sentinel completion time: %q", pending)
 	}
+}
+
+// TestImpossibleFlagsNeverStartACluster is the defect this fix was written for.
+//
+// Six flags used to be silently replaced by a default while the banner echoed
+// what the user had typed: `-duration -5s` printed "duration=-5s" and then ran
+// the eight-second configuration. A value the harness cannot honour has to be
+// refused, by name, before anything is built, started or printed.
+//
+// The probe is -bin-dir pointing at an empty directory. A run that got as far
+// as starting nodes fails there naming the binary it could not find, so the two
+// outcomes cannot be confused - and the control at the end proves the probe
+// really does fire when nothing refuses the flags first.
+func TestImpossibleFlagsNeverStartACluster(t *testing.T) {
+	empty := t.TempDir()
+
+	// Zero is meaningless for a count, a run length or a timeout; for a pause
+	// it means "none" and is tested as honoured elsewhere. Negatives are
+	// meaningless everywhere.
+	cases := []struct{ flag, value string }{
+		{"-duration", "-5s"},
+		{"-duration", "0"},
+		{"-keys", "0"},
+		{"-clients", "0"},
+		{"-op-timeout", "0"},
+		{"-quiesce", "-1s"},
+		{"-think", "-3s"},
+		{"-value-max", "1"},
+		{"-max-ops", "-1"},
+	}
+	commands := map[string]func(context.Context, []string) error{
+		"run":   cmdRun,
+		"sweep": cmdSweep,
+	}
+	for name, cmd := range commands {
+		for _, c := range cases {
+			t.Run(name+" "+c.flag+" "+c.value, func(t *testing.T) {
+				err := cmd(t.Context(), []string{"-target", "kvsingle", "-bin-dir", empty, c.flag, c.value})
+				if err == nil {
+					t.Fatalf("%s accepted %s %s", name, c.flag, c.value)
+				}
+				if !strings.Contains(err.Error(), c.flag) {
+					t.Fatalf("%s failed with %q, which never names %s; the value was replaced rather than refused",
+						name, err, c.flag)
+				}
+			})
+		}
+	}
+
+	t.Run("control: nothing else stops the run reaching the cluster", func(t *testing.T) {
+		err := cmdRun(t.Context(), []string{"-target", "kvsingle", "-bin-dir", empty, "-duration", "5s"})
+		if err == nil || !strings.Contains(err.Error(), "cluster") {
+			t.Fatalf("the probe does not detect a cluster start: %v", err)
+		}
+	})
+}
+
+// TestZeroPausesAreAcceptedAndHonoured is the exception that is not an
+// exception: zero is meaningless for a count or a run length, but for a pause
+// it means "none", which is a thing a person can genuinely want. Refusing it
+// would be as wrong as replacing it, and replacing it is what used to happen -
+// the harness reads a zero as a blank field unless it is told otherwise.
+func TestZeroPausesAreAcceptedAndHonoured(t *testing.T) {
+	f := parseRunFlags(t, "-think", "0", "-quiesce", "0")
+	cfg := f.harnessConfig(1).WithDefaults()
+	if cfg.ThinkMax != 0 {
+		t.Errorf("-think 0 became %s", cfg.ThinkMax)
+	}
+	if cfg.Quiesce != 0 {
+		t.Errorf("-quiesce 0 became %s", cfg.Quiesce)
+	}
+
+	// And the flags nobody typed still get the harness's own choice, or the
+	// fix above would have turned every default run into a hot loop.
+	untouched := parseRunFlags(t).harnessConfig(1).WithDefaults()
+	if untouched.ThinkMax <= 0 || untouched.Quiesce <= 0 {
+		t.Errorf("a run that asked for nothing got think=%s quiesce=%s", untouched.ThinkMax, untouched.Quiesce)
+	}
+}
+
+// parseRunFlags parses args the way run and sweep do, and fails the test if
+// they are refused.
+func parseRunFlags(t *testing.T, args ...string) *runFlags {
+	t.Helper()
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	f := &runFlags{}
+	f.register(fs)
+	if err := f.parse(fs, args); err != nil {
+		t.Fatalf("%v was refused: %v", args, err)
+	}
+	return f
 }
 
 func TestPlural(t *testing.T) {
