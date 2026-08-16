@@ -132,8 +132,31 @@ type runFlags struct {
 	verbose   bool
 }
 
+// targetNames lists every store this tool can start, derived from
+// cluster.Targets() rather than written out again.
+//
+// The help text and the unknown-target error were both hand-written copies of
+// that list, and both had gone stale in the same way: kvsplit was missing from
+// each. It is the store the repository is named after and the one its first
+// example runs, so a user who mistyped the name was told it did not exist.
+func targetNames() string {
+	names := make([]string, 0, len(cluster.Targets()))
+	for _, t := range cluster.Targets() {
+		names = append(names, string(t))
+	}
+	return strings.Join(names, ", ")
+}
+
+// validateTarget refuses a -target no cluster can be started for.
+func (f *runFlags) validateTarget() error {
+	if cluster.Target(f.target).Valid() {
+		return nil
+	}
+	return fmt.Errorf("unknown target %q (have %s)", f.target, targetNames())
+}
+
 func (f *runFlags) register(fs *flag.FlagSet) {
-	fs.StringVar(&f.target, "target", "kvquorum", "which store to test: kvsingle, kvforward, kvsync or kvquorum")
+	fs.StringVar(&f.target, "target", "kvquorum", "which store to test: "+targetNames())
 	fs.IntVar(&f.nodes, "nodes", 3, "how many node processes to start (kvsingle is always 1)")
 	fs.IntVar(&f.clients, "clients", 6, "concurrent client processes, spread round-robin across the nodes")
 	fs.IntVar(&f.keys, "keys", 4, "independent registers the clients share")
@@ -142,7 +165,7 @@ func (f *runFlags) register(fs *flag.FlagSet) {
 	fs.DurationVar(&f.opTimeout, "op-timeout", 400*time.Millisecond, "per-operation client timeout")
 	fs.DurationVar(&f.thinkMax, "think", 8*time.Millisecond, "upper bound on the pause between one client's operations")
 	fs.IntVar(&f.valueMax, "value-max", 1_000_000, "largest value clients write")
-	fs.StringVar(&f.faults, "faults", "partition", "fault schedule: none, partition, refuse, flaky or chaos")
+	fs.StringVar(&f.faults, "faults", "partition", "fault schedule: "+strings.Join(harness.ScheduleKinds(), ", "))
 	fs.DurationVar(&f.quiesce, "quiesce", 750*time.Millisecond, "settling time after healing, before the final reads")
 	fs.BoolVar(&f.keepAlive, "keep-alive", false, "reuse client connections between operations")
 	fs.StringVar(&f.binDir, "bin-dir", "", "directory of prebuilt node binaries; empty means build them with the go tool")
@@ -183,10 +206,10 @@ func (f *runFlags) checkerOptions() checker.Options {
 
 // oneRun starts a cluster, runs the load and checks the history.
 func oneRun(ctx context.Context, f *runFlags, seed int64, quiet bool) (*harness.Result, checker.Result, error) {
-	target := cluster.Target(f.target)
-	if !target.Valid() {
-		return nil, checker.Result{}, fmt.Errorf("unknown target %q (have kvsingle, kvforward, kvsync, kvquorum)", f.target)
+	if err := f.validateTarget(); err != nil {
+		return nil, checker.Result{}, err
 	}
+	target := cluster.Target(f.target)
 	m, err := model.ByName(f.modelName)
 	if err != nil {
 		return nil, checker.Result{}, err
@@ -246,6 +269,11 @@ func cmdRun(ctx context.Context, args []string) error {
 	counterPath := fs.String("counterexample", "", "write the minimal failing truncation here as JSON Lines")
 	seed := fs.Int64("seed", 1, "seed for the fault schedule and the operation generator")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	// Before the cluster, not after the verdict: an unusable expectation is the
+	// tool failing, and there is no reason to spend a run discovering it.
+	if _, err := parseExpectation(f.expect); err != nil {
 		return err
 	}
 
@@ -309,6 +337,9 @@ func cmdCheck(args []string) error {
 		return fmt.Errorf("check needs exactly one history file, got %d", len(files))
 	}
 	path := files[0]
+	if _, err := parseExpectation(*expect); err != nil {
+		return err
+	}
 
 	m, err := model.ByName(*modelName)
 	if err != nil {
@@ -384,6 +415,10 @@ func cmdSweep(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Judged once, up front. Judged per seed it became a mismatch count.
+	if _, err := parseExpectation(f.expect); err != nil {
+		return err
+	}
 
 	fmt.Printf("splitbrain sweep: target=%s seeds %d..%d faults=%s clients=%d keys=%d duration=%s expect=%s\n",
 		f.target, lo, hi, f.faults, f.clients, f.keys, f.duration, f.expect)
@@ -443,6 +478,12 @@ func cmdSchedule(args []string) error {
 	duration := fs.Duration("duration", 8*time.Second, "run length")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	// Checked before the slice is made. A negative count died in makeslice and
+	// zero died indexing an empty link list, both as panics with a stack trace,
+	// on an input a person can type by accident.
+	if *nodes < 1 {
+		return fmt.Errorf("-nodes is %d; a timeline needs at least one node", *nodes)
 	}
 
 	// Proxies to nowhere: the timeline depends only on the link names, and
@@ -560,12 +601,30 @@ func completion(op history.Op) string {
 	return dur(op.Complete)
 }
 
+// parseExpectation normalises an -expect value and refuses one it does not
+// recognise.
+//
+// It is separate from checkExpectation so that the commands can judge the flag
+// before they do any work rather than after. sweep called checkExpectation once
+// per seed and folded every error it returned into its mismatch counter, so a
+// misspelt expectation came out as "2 of 2 seeds did not match", on a line
+// directly below one reporting two linearizable verdicts - the tool accusing a
+// correct store because of a typo, with exit 1, which is the status that means
+// the store was wrong.
+func parseExpectation(expect string) (string, error) {
+	want := strings.ToLower(strings.TrimSpace(expect))
+	switch want {
+	case "", "any", "linearizable", "not-linearizable", "not_linearizable", "violation":
+		return want, nil
+	}
+	return "", fmt.Errorf("unknown -expect %q (have linearizable, not-linearizable, any)", expect)
+}
+
 // checkExpectation turns a verdict into an exit status.
 func checkExpectation(expect string, got checker.Verdict) error {
-	want := strings.ToLower(strings.TrimSpace(expect))
-	if want != "" && want != "any" && want != "linearizable" &&
-		want != "not-linearizable" && want != "not_linearizable" && want != "violation" {
-		return fmt.Errorf("unknown -expect %q (have linearizable, not-linearizable, any)", expect)
+	want, err := parseExpectation(expect)
+	if err != nil {
+		return err
 	}
 	if got == checker.Unknown {
 		// Checked before the expectation, deliberately. An undecided search is
@@ -602,14 +661,6 @@ func writeHistory(path string, h history.History) error {
 	return h.Save(fh)
 }
 
-// parseInterleaved parses flags that may appear before, after or among the
-// positional arguments, and returns the positional ones.
-//
-// Go's flag package stops at the first non-flag argument, so
-// `check history.jsonl -expect linearizable` silently treats the expectation
-// as a second file rather than as a flag. Every command-line tool that takes
-// one file and some options hits this, and the failure is quiet enough to
-// waste a genuinely surprising amount of time.
 // plural renders a count with its noun, so a report never says "1 keys".
 func plural(n int, word string) string {
 	if n == 1 {
@@ -618,6 +669,14 @@ func plural(n int, word string) string {
 	return fmt.Sprintf("%d %ss", n, word)
 }
 
+// parseInterleaved parses flags that may appear before, after or among the
+// positional arguments, and returns the positional ones.
+//
+// Go's flag package stops at the first non-flag argument, so
+// `check history.jsonl -expect linearizable` silently treats the expectation
+// as a second file rather than as a flag. Every command-line tool that takes
+// one file and some options hits this, and the failure is quiet enough to
+// waste a genuinely surprising amount of time.
 func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 	var positional []string
 	rest := args

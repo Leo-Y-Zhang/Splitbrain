@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,8 +66,7 @@ type Config struct {
 	// an impossible one.
 	ValueMax int
 
-	// Faults names the schedule: "none", "partition", or any kind understood
-	// by faultnet.Generate.
+	// Faults names the schedule. ScheduleKinds lists every accepted value.
 	Faults string
 
 	// Seed drives both the fault schedule and the operation generator.
@@ -153,6 +153,22 @@ func Keys(n int) []string {
 	return out
 }
 
+// ScheduleKinds lists every value BuildSchedule accepts for Config.Faults.
+//
+// It exists so that the flag help and the rejection message are one list rather
+// than two. They were two, and they disagreed: the help offered "none,
+// partition, refuse, flaky or chaos" while a bad value was answered by
+// faultnet.Generate with "have: healthy, partition, flaky, chaos" - which omits
+// the two node-level kinds this package adds on top, and so told a user their
+// typo should be replaced by a value the help had never mentioned, having just
+// refused two that work.
+//
+// "none" and "healthy" are the same empty schedule under both spellings; the
+// first is what the flag documents and the second is what faultnet calls it.
+func ScheduleKinds() []string {
+	return []string{"none", "healthy", "partition", "refuse", "flaky", "chaos"}
+}
+
 // BuildSchedule produces the fault timeline for a run.
 func BuildSchedule(t *Topology, cfg Config) (*faultnet.Schedule, error) {
 	cfg = cfg.WithDefaults()
@@ -168,7 +184,14 @@ func BuildSchedule(t *Topology, cfg Config) (*faultnet.Schedule, error) {
 		// check - and a much less realistic one.
 		return PartitionSchedule(t, cfg.Seed, cfg.Duration, faultnet.Refuse)
 	default:
-		return faultnet.Generate(cfg.Faults, t.LinkNames(), cfg.Seed, cfg.Duration)
+		s, err := faultnet.Generate(cfg.Faults, t.LinkNames(), cfg.Seed, cfg.Duration)
+		if err != nil {
+			// Reported against the set this function accepts, not the smaller
+			// set faultnet knows about.
+			return nil, fmt.Errorf("unknown fault schedule %q (have: %s)",
+				cfg.Faults, strings.Join(ScheduleKinds(), ", "))
+		}
+		return s, nil
 	}
 }
 
@@ -185,6 +208,14 @@ func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 		return nil, fmt.Errorf("harness: empty topology")
 	}
 	if cfg.ValueMax < minValueMax {
+		// Refusing rather than hanging. A compare-and-swap has to move the
+		// register to a different value - a no-op CAS constrains nothing, and
+		// history.Validate rejects one - and generate finds that value by
+		// retrying. On a domain of one value there is nothing to retry towards,
+		// so the loop never ends. It would not end at the start of the run
+		// either, but the first time a client came to believe a key held the
+		// only value there is, at which point the run stops making progress,
+		// ignores Duration, and leaves its node processes behind.
 		return nil, fmt.Errorf("harness: value-max is %d; it must be at least %d, because a compare-and-swap "+
 			"needs two different values to move between", cfg.ValueMax, minValueMax)
 	}
@@ -199,18 +230,6 @@ func Run(ctx context.Context, t *Topology, cfg Config) (*Result, error) {
 		return nil, fmt.Errorf("harness: %d client(s) across %d nodes; there must be at least one per node, "+
 			"or a partition cuts hops that were carrying no traffic and the clean verdict means nothing",
 			cfg.Clients, t.Nodes())
-	}
-	if cfg.ValueMax < minValueMax {
-		// Refusing rather than hanging. A compare-and-swap has to move the
-		// register to a different value - a no-op CAS constrains nothing, and
-		// history.Validate rejects one - and generate finds that value by
-		// retrying. On a domain of one value there is nothing to retry towards,
-		// so the loop never ends. It would not end at the start of the run
-		// either, but the first time a client came to believe a key held the
-		// only value there is, at which point the run stops making progress,
-		// ignores Duration, and leaves its node processes behind.
-		return nil, fmt.Errorf("harness: value-max is %d; it must be at least %d, because a compare-and-swap needs two different values to move between",
-			cfg.ValueMax, minValueMax)
 	}
 
 	sched, err := BuildSchedule(t, cfg)

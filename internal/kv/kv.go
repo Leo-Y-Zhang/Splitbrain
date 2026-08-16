@@ -146,6 +146,15 @@ func (w wireRequest) toRequest() (Request, error) {
 		if w.From == nil || w.To == nil {
 			return Request{}, fmt.Errorf("cas needs both from and to")
 		}
+		if *w.From == *w.To {
+			// The server used to answer this with ok:true, swapped:false, and
+			// history.Validate rejects a compare-and-swap that goes nowhere -
+			// so a session driven by hand produced a history the checker in
+			// the same repository then refused to read. Two halves of one tool
+			// disagreeing about what an operation is, is worse than either
+			// rule on its own.
+			return Request{}, fmt.Errorf("cas from %d to the same value constrains nothing", *w.From)
+		}
 		r.From, r.To = *w.From, *w.To
 	}
 	return r, nil

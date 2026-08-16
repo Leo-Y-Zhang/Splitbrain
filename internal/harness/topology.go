@@ -196,6 +196,13 @@ func (t *Topology) HealEvents(at time.Duration) []faultnet.Event {
 // network.
 func PartitionSchedule(t *Topology, seed int64, d time.Duration, f faultnet.Fault) (*faultnet.Schedule, error) {
 	names := t.LinkNames()
+	if t.Nodes() == 0 {
+		// Refused rather than indexed. A topology with no nodes has no links,
+		// and the single-node path below reaches for the first of them, so this
+		// arrived as "index out of range" from inside a schedule generator -
+		// two packages away from the flag that caused it.
+		return nil, fmt.Errorf("harness: a partition schedule needs at least one node, and this topology has none")
+	}
 	if t.Nodes() < 2 {
 		// One node has no boundary to cut. Blip its client link instead, so a
 		// single-node target still meets timeouts and indeterminate results.
@@ -247,6 +254,13 @@ func singleNodeSchedule(names []string, seed int64, d time.Duration, f faultnet.
 	now := d / 8
 	for now < d-(d/8) {
 		cutFor := jitter(rng, 200*time.Millisecond, 700*time.Millisecond)
+		if now+cutFor > d {
+			// The heal has to land inside the run, exactly as the multi-node
+			// generator above already ensures. Without this the phase ran off
+			// the end and NewNamedSchedule rejected the schedule, so a short
+			// run did not partition less - it refused to start.
+			cutFor = d - now
+		}
 		events = append(events,
 			faultnet.Event{At: now, Link: names[0], Fault: f},
 			faultnet.Event{At: now + cutFor, Link: names[0], Fault: faultnet.Pass},

@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -227,6 +229,91 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 	if err := c.Close(); err != nil {
 		t.Fatalf("the second Close returned %v", err)
+	}
+}
+
+// TestCloseReportsABinaryDirectoryItCouldNotRemove pins the difference between
+// a cleanup that worked and one that was thrown away.
+//
+// Close used to remove the binaries it built with `_ = os.RemoveAll(...)`, so a
+// removal that failed left roughly seven megabytes per run behind and said
+// nothing. Windows holds a handle on a running executable image and does not
+// always release it the instant Wait returns, which is exactly when Close tries
+// to delete it; the directories are removable again moments later, which is why
+// this shows up as disk creeping upwards rather than as an error anyone sees.
+//
+// The failure is staged with an open handle rather than by racing a real node,
+// because the race is rare - 130 build-and-close cycles on the machine this was
+// written on did not lose one - and a test that only fails on an unlucky day is
+// not a test. What is being asserted is the part that is true every time: if
+// the directory cannot be removed, Close says so.
+func TestCloseReportsABinaryDirectoryItCouldNotRemove(t *testing.T) {
+	dir := t.TempDir()
+	stuck := filepath.Join(dir, exeName("kvsingle"))
+	if err := os.WriteFile(stuck, []byte("stands in for a node binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fh, err := os.Open(stuck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fh.Close()
+
+	// No nodes: this is about the binaries, and starting a real cluster would
+	// make the test depend on the race it is deliberately not racing.
+	c := &Cluster{target: Single, tempBin: dir}
+	closeErr := c.Close()
+
+	if _, statErr := os.Stat(stuck); statErr != nil {
+		t.Skip("this platform removes a file that is still open, so an unremovable directory cannot be staged here")
+	}
+	if closeErr == nil {
+		t.Fatalf("Close left %s on disk and reported success; a cleanup failure nobody is told about is how the leak accumulated", dir)
+	}
+	if !strings.Contains(closeErr.Error(), dir) {
+		t.Errorf("Close reported %q, which does not name the directory a person has to delete (%s)", closeErr, dir)
+	}
+}
+
+// TestPolicyBlockedOnlyMatchesTheMachineRefusingToExecute guards the predicate
+// that decides whether a failure is this machine's business or this
+// repository's.
+//
+// It is load-bearing in both directions and the two mistakes are not
+// symmetrical. Match too little and Windows Smart App Control blocking an
+// unsigned binary is reported as a defect in the tool, which wastes an
+// afternoon. Match too much and a genuine failure - a node that never bound, a
+// binary that is not there - is quietly skipped by `tools/demo
+// -allow-policy-skips`, and the demonstration reports an incomplete run as an
+// explained one. The second is the one that costs something, so the negative
+// cases below are the point of this test rather than the decoration.
+func TestPolicyBlockedOnlyMatchesTheMachineRefusingToExecute(t *testing.T) {
+	// The message as the operating system actually delivers it, observed on
+	// this machine.
+	blocked := errors.New(`fork/exec C:\Users\x\AppData\Local\Temp\go-build1\b001\splitbrain.test.exe: ` +
+		`An Application Control policy has blocked this file.`)
+	if !PolicyBlocked(blocked) {
+		t.Errorf("a real Smart App Control refusal was not recognised: %v", blocked)
+	}
+	if !PolicyBlocked(fmt.Errorf("cluster: starting kvquorum: %w", blocked)) {
+		t.Error("a wrapped refusal was not recognised; cluster.Start wraps every start error")
+	}
+
+	// Everything a run can fail with that is not the machine's policy. Any of
+	// these being skipped would turn a defect into a shrug.
+	for _, err := range []error{
+		nil,
+		errors.New(`cluster: n0 printed "hello", want "listening <addr>"`),
+		errors.New("cluster: n2 did not announce an address within 20s"),
+		errors.New(`cluster: C:\bin\kvsingle.exe: The system cannot find the file specified.`),
+		errors.New("cluster: configuring n2: 500 Internal Server Error"),
+		errors.New("harness: value-max is 1; it must be at least 2"),
+		errors.New("permission denied"),
+		errors.New("access is denied"),
+	} {
+		if PolicyBlocked(err) {
+			t.Errorf("PolicyBlocked(%v) is true; a real failure would be skipped as a machine policy", err)
+		}
 	}
 }
 

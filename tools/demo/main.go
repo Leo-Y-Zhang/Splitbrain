@@ -92,7 +92,16 @@ func run(ctx context.Context, seeds int, duration time.Duration, clients, keys, 
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(binDir)
+	// Not a plain os.RemoveAll: these binaries have just been executed dozens
+	// of times as separate processes, and Windows does not always release the
+	// handle on an executable image the instant the process exits. A single
+	// attempt leaves the whole build - four binaries, tens of megabytes -
+	// behind without a word.
+	defer func() {
+		if rmErr := cluster.RemoveBuiltBinaries(binDir); rmErr != nil {
+			fmt.Fprintf(os.Stderr, "demo: %v\n", rmErr)
+		}
+	}()
 
 	if outDir != "" {
 		if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -229,13 +238,32 @@ func run(ctx context.Context, seeds int, duration time.Duration, clients, keys, 
 		return fmt.Errorf("%d assertion(s) failed", len(failures))
 	}
 
+	// Loudly, and last, so a partial run cannot be mistaken for a complete one.
+	// A demonstration that reads like a full one is worse than a failure.
+	var incomplete []string
+	if !control {
+		// -control=false used to be silent, and then the run signed off with
+		// the same sentence a complete one uses - including the clause "the
+		// network really was broken", which is precisely the claim the control
+		// is there to earn. Without it kvsplit is only ever seen under
+		// partition, so nothing distinguishes "the partition caught it" from
+		// "it was broken all along", which is the entire argument of the table
+		// this tool prints.
+		incomplete = append(incomplete,
+			"the healthy-network control did not run (-control=false), so nothing here shows that the partition is what caught kvsplit rather than kvsplit being wrong anyway")
+	}
 	if len(skipped) > 0 {
-		// Loudly, and last, so it cannot be mistaken for a complete run. A
-		// partial demonstration that reads like a full one is worse than a
-		// failure.
-		fmt.Printf("INCOMPLETE: %d subject(s) were skipped because this machine refused to execute their binary: %s\n",
-			len(skipped), strings.Join(skipped, ", "))
-		fmt.Println("Every subject that did run met its expectation. Run this where nothing blocks unsigned binaries for the whole claim.")
+		incomplete = append(incomplete, fmt.Sprintf(
+			"%d subject(s) were skipped because this machine refused to execute their binary: %s",
+			len(skipped), strings.Join(skipped, ", ")))
+	}
+	if len(incomplete) > 0 {
+		for _, note := range incomplete {
+			fmt.Printf("INCOMPLETE: %s\n", note)
+		}
+		// Deliberately not "every assertion held": the sign-off has to differ
+		// from a complete run's, and it must not presume which half was missing.
+		fmt.Println("Every assertion that was checked held, but the above is not the whole claim.")
 		return nil
 	}
 
