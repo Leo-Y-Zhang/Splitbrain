@@ -347,6 +347,28 @@ def recover() -> None:
     clear_sidecar()
 
 
+# Markers for a run that never got as far as executing the tests. The policy
+# one is Windows Application Control, which refuses to launch an unsigned
+# binary it has no reputation for and decides per content hash, so the same
+# mutation can be blocked on one run and fine on the next.
+BLOCKED = (
+    "Application Control policy",
+    "Permission denied",
+    "Access is denied",
+    "operation not permitted",
+)
+DID_NOT_BUILD = ("build failed", "cannot use", "undefined:", "syntax error", "declared and not used")
+
+
+def classify_failure(output: str) -> str:
+    """Say why a mutant run failed without a named test failing."""
+    if any(b in output for b in BLOCKED):
+        return "the tests could not be launched on this machine"
+    if any(b in output for b in DID_NOT_BUILD):
+        return "did not compile"
+    return "the package failed without a named test"
+
+
 def apply_mutation(m: Mutation) -> str:
     """Write the mutant and return the original text, held in memory.
 
@@ -423,14 +445,26 @@ def main() -> int:
 
         killers = failing_tests(output)
         if not killers:
-            # A build failure is not a test death. If the mutant does not
-            # compile, the mutation is testing the compiler.
-            if "build failed" in output or "cannot use" in output or "undefined:" in output:
-                print(f"DID NOT COMPILE ({elapsed:.1f}s)")
-                survivors.append(m)
-                rows.append((m, ["(did not compile - not evidence)"]))
-                continue
-            killers = ["(the package failed without a named test)"]
+            # A non-zero exit is not a test death. Three things produce one, and
+            # only the first is evidence:
+            #
+            #   * a named test failed          -> handled above
+            #   * the mutant did not compile   -> the mutation tested the compiler
+            #   * the tests could not be run   -> nothing was tested at all
+            #
+            # The last one used to be scored as a kill, which is the worst
+            # possible default: on this machine Windows Application Control
+            # blocks freshly built test binaries by content hash, so a mutant
+            # nobody ever executed was being written into MUTATIONS.md as
+            # evidence that a rule is pinned. A harness that manufactures
+            # evidence when it is prevented from gathering any is worse than no
+            # harness, because the file it writes is the thing everything else
+            # is certified by.
+            reason = classify_failure(output)
+            print(f"{reason.upper()} ({elapsed:.1f}s)")
+            survivors.append(m)
+            rows.append((m, [f"({reason} - not evidence)"]))
+            continue
         print(f"killed by {killers[0]}" + (f" and {len(killers) - 1} more" if len(killers) > 1 else "")
               + f" ({elapsed:.1f}s)")
         rows.append((m, killers))
@@ -439,7 +473,8 @@ def main() -> int:
         write_evidence(rows)
 
     if survivors:
-        print(f"\n{len(survivors)} mutation(s) survived; the suite does not pin those rules:", file=sys.stderr)
+        print(f"\n{len(survivors)} mutation(s) produced no evidence "
+              f"(survived, did not compile, or could not be launched):", file=sys.stderr)
         for m in survivors:
             print(f"  {m.ident}  {m.rule}", file=sys.stderr)
         return 1

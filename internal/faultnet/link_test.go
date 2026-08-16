@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -555,18 +556,50 @@ func TestSetUnderConcurrentTraffic(t *testing.T) {
 // promise than the one Close makes. That is only meaningful because the target
 // used here runs no goroutine per connection, so everything above the baseline
 // belongs to the link.
-// settledGoroutines waits for the goroutine count to stop moving and returns
-// it. A single reading races whatever the runtime happens to be finishing, and
-// a baseline that is one goroutine too low turns this test into a source of
-// failures nobody can reproduce.
-func settledGoroutines(within time.Duration) int {
+// linkGoroutines counts the goroutines a Link is currently running, by looking
+// for its own frames in the stack dump rather than by counting every goroutine
+// in the process.
+//
+// The process-wide count was the wrong instrument, and it took two goes to see
+// it. Warming up first fixed the obvious half - the machinery a process brings
+// up on its first link - but the count still includes goroutines belonging to
+// whatever else the test binary is doing, and under `go test ./...` that
+// includes the backend server this very test is talking to. Its handler
+// goroutine routinely outlives Close by microseconds, which is not a leak in
+// the Link and has nothing to do with Close waiting properly. Measured at
+// roughly one full-suite run in three, and it took an unrelated change down
+// with it on CI.
+//
+// Counting frames is both stabler and stricter: it can no longer be fooled by
+// something else in the process, and the number it produces is one a reader can
+// act on, because every goroutine it counts is one this package started.
+func linkGoroutines() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	// Goroutine dumps separate one goroutine from the next with a blank line.
+	count := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "faultnet.(*Link).") {
+			count++
+		}
+	}
+	return count
+}
+
+// settledLinkGoroutines waits for that count to stop moving and returns it.
+func settledLinkGoroutines(within time.Duration) int {
 	deadline := time.Now().Add(within)
-	runtime.GC()
-	last := runtime.NumGoroutine()
+	last := linkGoroutines()
 	for time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
-		runtime.GC()
-		n := runtime.NumGoroutine()
+		n := linkGoroutines()
 		if n == last {
 			return n
 		}
@@ -600,7 +633,7 @@ func TestCloseIsIdempotentAndLeavesNoGoroutines(t *testing.T) {
 	if err := warm.Close(); err != nil {
 		t.Fatalf("warm-up Close: %v", err)
 	}
-	base := settledGoroutines(5 * time.Second)
+	base := settledLinkGoroutines(5 * time.Second)
 
 	l, err := NewLink("leaky", srv)
 	if err != nil {
@@ -643,8 +676,8 @@ func TestCloseIsIdempotentAndLeavesNoGoroutines(t *testing.T) {
 	// Read immediately and without a GC: the whole claim is that Close does
 	// not return until its goroutines have gone, so anything that settles
 	// afterwards is exactly what this is looking for.
-	immediate := runtime.NumGoroutine()
-	t.Logf("Close returned in %v with %d goroutines against a baseline of %d", closeTook, immediate, base)
+	immediate := linkGoroutines()
+	t.Logf("Close returned in %v with %d link goroutines against a baseline of %d", closeTook, immediate, base)
 
 	if err := l.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
@@ -656,13 +689,13 @@ func TestCloseIsIdempotentAndLeavesNoGoroutines(t *testing.T) {
 	if immediate > base {
 		// Distinguish the two failures, because they need different fixes:
 		// a missing wait, or a goroutine that never comes back at all.
-		if waitFor(5*time.Second, func() bool { return runtime.NumGoroutine() <= base }) {
-			t.Fatalf("Close returned with %d goroutines still running against a baseline of %d; they left afterwards, so Close is not waiting for them",
+		if waitFor(5*time.Second, func() bool { return linkGoroutines() <= base }) {
+			t.Fatalf("Close returned with %d link goroutines still running against a baseline of %d; they left afterwards, so Close is not waiting for them",
 				immediate, base)
 		}
 		buf := make([]byte, 1<<16)
 		n := runtime.Stack(buf, true)
-		t.Fatalf("goroutines %d > baseline %d and never left\n%s", runtime.NumGoroutine(), base, buf[:n])
+		t.Fatalf("link goroutines %d > baseline %d and never left\n%s", linkGoroutines(), base, buf[:n])
 	}
 
 	// A closed link accepts no more connections.
