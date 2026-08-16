@@ -15,7 +15,7 @@ result differs from what is committed.
 | H03 | `internal/history/history.go` | One client cannot have two requests in flight. Without this check a harness bug silently removes real-time constraints and the checker becomes a rubber stamp. | `TestValidateRejects (+1 more)` |
 | H04 | `internal/history/history.go` | A process retires after an indeterminate operation. Letting it continue asserts an ordering the client had no way to know. | `TestValidateExplainsWhyAProcessMustRetire` |
 | H05 | `internal/history/history.go` | Two zero-width operations on one key at one instant are refused. Each completes at or before the other is invoked, so no order respects real time - and the entry list cannot express that, so the search picks one and reports a pass. | `TestAdversarialDifferentialAgainstBruteForce (+1 more)` |
-| M01 | `internal/model/model.go` | A successful read must return the value the register holds. | `TestCASRegisterRead (+17 more)` |
+| M01 | `internal/model/model.go` | A successful read must return the value the register holds. | `TestCASRegisterRead (+16 more)` |
 | M02 | `internal/model/model.go` | A compare-and-swap that reports success is a claim about the exact value the register held. It is the operation that catches split brain. | `TestCASRegisterCatchesLyingCAS (+3 more)` |
 | M03 | `internal/model/model.go` | An indeterminate operation reports nothing, so nothing it appears to have returned may be believed. | `TestIndeterminateOperationsConstrainNothingButStillApply (+3 more)` |
 | M04 | `internal/model/model.go` | A model must refuse operations it does not describe rather than quietly accept them. | `TestRegisterRefusesCAS` |
