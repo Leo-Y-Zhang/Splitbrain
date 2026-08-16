@@ -39,14 +39,15 @@ The same store on a healthy network, same workload, same checker:
 ## The result
 
 Five seeds per store, six seconds each, six concurrent clients over four
-registers, on a three-node cluster. `tools/demo` runs exactly this in CI, on
-Linux, on every push; the counts below were measured on the machine this was
-written on, and the CI run is the one to believe.
+registers, on a three-node cluster: 12,520 to 12,560 operations per store. These
+are the numbers from `tools/demo`, which CI runs on Linux on every push, and
+they match what the same command produces on the Windows machine this was
+written on.
 
-The three rows CI *asserts* are `kvsingle` and `kvforward` staying clean, and
-`kvsplit` being clean healthy and caught under partition. The last two rows are
-measured rather than asserted, because how often an already-broken store gets
-caught on a healthy network depends on the machine.
+CI *asserts* the first three rows. The last two are measured rather than
+asserted: how often an already-broken store gets caught without any help
+depends on the machine, and pretending otherwise would be the kind of claim
+this repository exists to disallow.
 
 | store | what it is | under partition | healthy network |
 | --- | --- | ---: | ---: |

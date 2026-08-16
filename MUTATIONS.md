@@ -26,3 +26,4 @@ result differs from what is committed.
 | C05 | `internal/checker/checker.go` | An operation still in flight at the truncation point had told the client nothing yet, so its result must be discarded. Keeping it makes the counterexample claim knowledge nobody had. | `TestMinimiseReturnsAPrefixWhenTheViolationIsLast` |
 | C06 | `internal/checker/checker.go` | Minimisation returns the earliest failing truncation, not the whole history. Returning everything is not wrong, only useless, and nothing would have noticed. | `TestMinimiseShrinksToTheViolation (+2 more)` |
 | C07 | `internal/checker/brute.go` | The reference oracle enforces real time with the same strictness as the history's own concurrency test. A weaker oracle would agree with a broken checker. | `TestBruteForceMatchesTheCorpus (+2 more)` |
+

@@ -254,13 +254,18 @@ def read_source(path: Path) -> str:
     the way out, so on Windows a restore would rewrite every line of the file
     it was supposed to leave alone. gofmt then reports the whole tree as
     unformatted, and the mutation harness has quietly become a source of diffs.
+
+    open() rather than Path.read_text: the newline argument only reached the
+    pathlib helpers in Python 3.13, and CI runs an older one.
     """
-    return path.read_text(encoding="utf-8", newline="")
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
 
 
 def write_source(path: Path, text: str) -> None:
     """Write a source file back exactly as given. See read_source."""
-    path.write_text(text, encoding="utf-8", newline="")
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
 
 
 def apply_mutation(m: Mutation) -> str:
@@ -375,7 +380,7 @@ def write_evidence(rows) -> None:
             shown += f" (+{len(killers) - 1} more)"
         lines.append(f"| {m.ident} | `{m.path}` | {m.rule} | `{shown}` |")
     lines.append("")
-    EVIDENCE.write_text("\n".join(lines), encoding="utf-8")
+    write_source(EVIDENCE, "\n".join(lines) + "\n")
     print(f"wrote {EVIDENCE.relative_to(ROOT)}")
 
 
