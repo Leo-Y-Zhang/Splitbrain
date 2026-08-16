@@ -373,12 +373,22 @@ func (h History) Counts() (ok, fail, info int) {
 	return
 }
 
+// instant names one key at one moment. It is the map key for the zero-width
+// check in Validate, which has to be per key: two independent registers may
+// legitimately be touched at the same instant, because the checker searches
+// them separately.
+type instant struct {
+	key string
+	t   int64
+}
+
 // Validate checks the structural invariants a recorded history must satisfy.
 // Every one of these has bitten a real harness: a completion before its own
 // invocation, or one process with two operations in flight at once, quietly
 // removes a real-time constraint and turns a checker into a rubber stamp.
 func (h History) Validate() error {
 	byProc := map[int]History{}
+	instants := map[instant]bool{}
 	for i, op := range h {
 		if op.Invoke < 0 {
 			return fmt.Errorf("op %d: negative invoke time %d", i, op.Invoke)
@@ -405,6 +415,28 @@ func (h History) Validate() error {
 			// Not wrong, but a no-op CAS constrains nothing and is almost
 			// always a generator bug rather than an interesting operation.
 			return fmt.Errorf("op %d: cas from %d to the same value", i, op.From)
+		}
+		// Two zero-width operations on one key at one instant are a
+		// contradiction rather than a coincidence. By the rule every other
+		// part of this tool uses - A precedes B when A completes at or before
+		// B is invoked - each of them strictly precedes the other, so real
+		// time orders them both ways and no linearization can respect it.
+		// BruteForce duly refuses to place either. The fast search cannot
+		// express that: its entry list is linear, so one of the two has to
+		// come first, and it would pick an order and report a pass that
+		// depends on where the operations sat in the input slice.
+		//
+		// clock.Completion is what stops a run producing a zero-width
+		// interval, and says why. This is what stops a history file supplying
+		// one. A lone instantaneous operation stays legal: it orders
+		// consistently against everything around it.
+		if op.Outcome != Info && op.Complete == op.Invoke {
+			at := instant{key: op.Key, t: op.Invoke}
+			if instants[at] {
+				return fmt.Errorf("op %d: a second zero-width operation on key %q at %d; each of them "+
+					"completes at or before the other is invoked, so no order respects real time", i, op.Key, op.Invoke)
+			}
+			instants[at] = true
 		}
 		byProc[op.Process] = append(byProc[op.Process], op)
 	}
