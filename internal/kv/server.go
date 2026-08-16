@@ -307,7 +307,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // address the kernel actually chose. The harness parses that line, so nothing
 // else in any of these binaries may write to stdout; logs go to stderr. The
 // write is a single syscall on an unbuffered *os.File, so it needs no explicit
-// flush and cannot be interleaved with a later one.
+// flush and cannot be interleaved with a later one. It happens only after the
+// stop signals are being watched, so that announcing readiness never precedes
+// being able to shut down cleanly.
 //
 // It returns when ctx is cancelled, when SIGINT or SIGTERM arrives, or when
 // stdin reaches EOF. The last of those is how the harness stops a node on
@@ -319,13 +321,13 @@ func Run(ctx context.Context, addr, id string, store Store, logger *slog.Logger)
 	if err := srv.Listen(addr); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(os.Stdout, "listening %s\n", srv.Addr()); err != nil {
-		return fmt.Errorf("announcing the bound address: %w", err)
-	}
-	if logger != nil {
-		logger.Info("listening", "node", id, "addr", srv.Addr())
-	}
-
+	// The signal handler goes in before the address is announced, and the
+	// order is load-bearing. Announcing is what tells a supervisor the node is
+	// ready, and a supervisor that stops it immediately afterwards would
+	// otherwise land its SIGTERM in the window before signal.NotifyContext has
+	// registered - where the default disposition applies and the process dies
+	// by signal instead of shutting down. Found by CI on Linux; Windows has no
+	// SIGTERM a parent can send, so it could not have surfaced here.
 	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	ctx, cancel := context.WithCancel(ctx)
@@ -334,6 +336,13 @@ func Run(ctx context.Context, addr, id string, store Store, logger *slog.Logger)
 		io.Copy(io.Discard, os.Stdin)
 		cancel()
 	}()
+
+	if _, err := fmt.Fprintf(os.Stdout, "listening %s\n", srv.Addr()); err != nil {
+		return fmt.Errorf("announcing the bound address: %w", err)
+	}
+	if logger != nil {
+		logger.Info("listening", "node", id, "addr", srv.Addr())
+	}
 
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve() }()
