@@ -346,7 +346,7 @@ tools/demo          the table above, executable; CI runs it on every push
 tools/mutations.py  the mutation evidence
 ```
 
-7,500 lines of Go and 7,600 lines of tests — 233 test functions, 372 cases
+7,800 lines of Go and 8,200 lines of tests — 242 test functions, 379 cases
 including subtests. **No dependencies**: standard library only, and CI fails if
 `go.sum` ever stops being empty.
 
