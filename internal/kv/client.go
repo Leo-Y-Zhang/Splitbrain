@@ -124,6 +124,15 @@ func peerBase(addr string) (string, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
+		// Only the reason, not the *url.Error wrapping it: that restates the
+		// address a second time, with the scheme this function just prepended
+		// glued on. Both copies are quoted, so this is legibility rather than
+		// safety, and one copy is enough for a message that is logged and
+		// handed back to whoever sent the address.
+		var perr *url.Error
+		if errors.As(err, &perr) {
+			err = perr.Err
+		}
 		return "", fmt.Errorf("peer address %q is not a URL: %w", addr, err)
 	}
 	if u.Host == "" {

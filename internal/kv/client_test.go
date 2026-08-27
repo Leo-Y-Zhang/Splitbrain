@@ -454,6 +454,7 @@ func TestPeerBase(t *testing.T) {
 		{"credentials", "http://user:pass@127.0.0.1:8080", ""},
 		{"nothing at all", "", ""},
 		{"a path and no host", "/admin/wipe", ""},
+		{"a control character", "127.0.0.1:8080/\nlevel=ERROR", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := peerBase(tc.addr)
@@ -470,6 +471,20 @@ func TestPeerBase(t *testing.T) {
 				t.Errorf("peerBase(%q) = %q, want %q", tc.addr, got, tc.want)
 			}
 		})
+	}
+}
+
+// A refusal is logged and handed back to whoever supplied the address, so the
+// address belongs in it once. url.Parse fails with an error that repeats the
+// whole thing, scheme and all, which is the second copy this checks for.
+func TestPeerBaseRefusalNamesTheAddressOnce(t *testing.T) {
+	const addr = "127.0.0.1:8080/\nlevel=ERROR"
+	_, err := peerBase(addr)
+	if err == nil {
+		t.Fatal("peerBase accepted an address with a control character in it")
+	}
+	if n := strings.Count(err.Error(), "127.0.0.1:8080"); n != 1 {
+		t.Errorf("the refusal names the address %d times, want 1: %s", n, err)
 	}
 }
 
