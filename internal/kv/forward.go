@@ -236,6 +236,15 @@ func (s *ForwardStore) Configure(cfg Config) error {
 	if cfg.PromoteAfter != nil && *cfg.PromoteAfter < 1 {
 		return errors.New("promote-after must be at least 1")
 	}
+	// Checked before anything is applied, so a configuration this node refuses
+	// leaves it exactly as it was. The address arrives over an unauthenticated
+	// endpoint and decides where this process sends traffic, so it is worth
+	// refusing by name rather than discovering at the first forward.
+	if cfg.Leader != nil && *cfg.Leader != "" {
+		if _, err := peerBase(*cfg.Leader); err != nil {
+			return err
+		}
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

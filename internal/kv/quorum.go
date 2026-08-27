@@ -176,6 +176,20 @@ func (s *QuorumStore) replicate(ctx context.Context, fan *fanout, synchronous bo
 // empty list isolates the node, which is how a harness can partition one
 // without touching the network.
 func (s *QuorumStore) Configure(cfg Config) error {
+	// Checked before anything is applied, so a configuration this node refuses
+	// leaves it exactly as it was, sync mode included. The addresses arrive
+	// over an unauthenticated endpoint and decide where this process sends
+	// traffic; newFanout ignores empty entries, so this does too.
+	if cfg.Peers != nil {
+		for _, addr := range *cfg.Peers {
+			if addr == "" {
+				continue
+			}
+			if _, err := peerBase(addr); err != nil {
+				return err
+			}
+		}
+	}
 	if cfg.Sync != nil {
 		s.mu.Lock()
 		s.synchronous = *cfg.Sync

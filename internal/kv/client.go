@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -60,8 +61,12 @@ type ClientOptions struct {
 // own Client: a process is meant to be sequential, and sharing one Client
 // makes that easy to break by accident.
 type Client struct {
-	addr    string
-	base    string
+	addr string
+	base string
+	// refuse is set when addr was not a usable peer address, and is returned
+	// by every request method instead of dialling. A Client that cannot say
+	// where it is pointed must not guess: see peerBase.
+	refuse  error
 	timeout time.Duration
 	http    *http.Client
 }
@@ -76,14 +81,15 @@ func NewClient(addr string, timeout time.Duration) *Client {
 }
 
 // NewClientWithOptions is NewClient with the transport behaviour spelled out.
+//
+// An address that is not a bare host and port yields a Client that refuses
+// every request rather than one pointed somewhere unintended; see peerBase.
 func NewClientWithOptions(addr string, timeout time.Duration, opts ClientOptions) *Client {
-	base := addr
-	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
-		base = "http://" + base
-	}
+	base, refuse := peerBase(addr)
 	return &Client{
 		addr:    addr,
-		base:    strings.TrimSuffix(base, "/"),
+		base:    base,
+		refuse:  refuse,
 		timeout: timeout,
 		http: &http.Client{
 			Transport: &http.Transport{
@@ -95,6 +101,42 @@ func NewClientWithOptions(addr string, timeout time.Duration, opts ClientOptions
 
 // Addr returns the address the Client was built for, as given.
 func (c *Client) Addr() string { return c.addr }
+
+// peerBase turns a peer address into the prefix every request to that peer is
+// built from, and refuses anything that is more than a host and a port.
+//
+// The refusal is the security-relevant half. POST /configure is
+// unauthenticated by design - see exposureWarning - so the addresses arriving
+// in it are the least trustworthy input this package handles, and the old rule
+// simply glued whatever it was given to the endpoint path. A leader of
+// "10.0.0.5/admin/wipe?ok=" made this node issue POSTs to
+// 10.0.0.5/admin/wipe?ok=/kv, so whoever could reach the port could aim the
+// process at any URL on any host it could see, and use its network position
+// rather than their own. Rebuilding the prefix out of nothing but the scheme
+// and the host leaves the endpoint paths this package asks for the only ones
+// the process can ever request. Which hosts it will talk to is still whatever
+// it was told, because a fixture whose peers are assigned at runtime cannot
+// know them in advance; that residue is what the warning is for.
+func peerBase(addr string) (string, error) {
+	raw := addr
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("peer address %q is not a URL: %w", addr, err)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("peer address %q names no host", addr)
+	}
+	// A bare "/" is what a trailing slash parses to, which is the same
+	// destination and was always accepted; anything beyond it is not.
+	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("peer address %q must be a host and port and nothing else, "+
+			"with no user, path, query or fragment", addr)
+	}
+	return u.Scheme + "://" + u.Host, nil
+}
 
 // Do issues one operation and returns it as a fully populated history.Op.
 //
@@ -173,6 +215,12 @@ func (c *Client) Do(ctx context.Context, clk *clock.Clock, process int, req Requ
 // nil error means a well-formed reply came back with status 200; the reply may
 // still be a refusal. Every non-nil error is a *TransportError.
 func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
+	if c.refuse != nil {
+		// NeverSent is exactly right here and it matters: nothing was dialled,
+		// so the operation definitely did not take effect and the caller may
+		// record a definite failure rather than an indeterminate one.
+		return Response{}, &TransportError{NeverSent: true, Err: c.refuse}
+	}
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
@@ -229,6 +277,9 @@ func (c *Client) Configure(ctx context.Context, cfg Config) error {
 // bounded by the client's timeout, which matters for peer traffic because the
 // address may be a fault proxy that has stopped forwarding.
 func (c *Client) postJSON(ctx context.Context, path string, v any) error {
+	if c.refuse != nil {
+		return c.refuse
+	}
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
@@ -268,6 +319,9 @@ func (c *Client) postJSON(ctx context.Context, path string, v any) error {
 // Health asks the server who it is. It is how a harness waits for a freshly
 // started node to be ready.
 func (c *Client) Health(ctx context.Context) (string, error) {
+	if c.refuse != nil {
+		return "", c.refuse
+	}
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)

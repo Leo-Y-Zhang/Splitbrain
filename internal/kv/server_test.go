@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -289,5 +290,75 @@ func TestConfigureRejectsMalformedBody(t *testing.T) {
 	}
 	if err := c.Configure(context.Background(), Config{}); err != nil {
 		t.Errorf("the node should still be usable after a bad configure: %v", err)
+	}
+}
+
+// TestConfigureRefusesAPeerAddressThatIsMoreThanAHost covers the endpoint these
+// fixtures are warned about. It is unauthenticated on purpose, and the address
+// it carries decides where the node sends traffic: a host and a port names a
+// peer, whereas a host with a path attached is an instruction to use this
+// process as a way of reaching some other URL. That is refused by name, before
+// any of the configuration is applied.
+func TestConfigureRefusesAPeerAddressThatIsMoreThanAHost(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		store Store
+		body  string
+	}{
+		{"a quorum peer", NewQuorumStore("n1", nil, testTimeout, nil), `{"peers":["127.0.0.1:9/admin/wipe"]}`},
+		{"a forward leader", NewForwardStore("", testTimeout, nil), `{"leader":"http://127.0.0.1:9/admin/wipe"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := serve(t, "n1", tc.store)
+			status, body := post(t, c, "/configure", tc.body)
+			if status != http.StatusOK {
+				t.Errorf("status = %d, want 200", status)
+			}
+			if !strings.Contains(body, `"ok":false`) {
+				t.Errorf("body = %s, want a refusal", body)
+			}
+			if err := c.Configure(context.Background(), Config{}); err != nil {
+				t.Errorf("the node should still be usable after a refused configure: %v", err)
+			}
+		})
+	}
+}
+
+// TestAHostileKeyCannotForgeALogLine pins the property that makes it safe to
+// log a key exactly as the client sent it. The text handler quotes anything
+// holding a control character in every position it writes - message, key,
+// value and group name alike - so a key carrying a newline and a plausible
+// prefix becomes one escaped field of one line rather than a second line a
+// reader would take for this node's own.
+//
+// It is worth a test rather than a comment because the property belongs to the
+// handler and not to this package: no call site here can be read to find out
+// whether it holds. Pointing NewLogger at a handler that wrote values raw
+// would reintroduce log injection at every call site at once, and nothing else
+// in the suite would notice.
+func TestAHostileKeyCannotForgeALogLine(t *testing.T) {
+	var buf bytes.Buffer
+	srv := httptest.NewServer(NewServer("n1", NewSingleStore(), NewLogger(&buf)).Handler())
+	t.Cleanup(srv.Close)
+	c := NewClient(strings.TrimPrefix(srv.URL, "http://"), testTimeout)
+
+	// A real newline in the key, followed by something shaped exactly like a
+	// line this node emits.
+	const forged = `level=ERROR msg=forged node=somebody-else`
+	if status, _ := post(t, c, "/kv", `{"op":"write","key":"x\n`+forged+`","value":1}`); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+
+	logged := strings.TrimRight(buf.String(), "\n")
+	if logged == "" {
+		t.Fatal("the operation was not logged at all")
+	}
+	if lines := strings.Count(logged, "\n") + 1; lines != 1 {
+		t.Errorf("one operation wrote %d log lines:\n%s", lines, logged)
+	}
+	// Escaped, not dropped: the key still has to be legible to whoever is
+	// reading the log to work out what happened.
+	if !strings.Contains(logged, `\n`+forged) {
+		t.Errorf("the key did not survive escaped:\n%s", logged)
 	}
 }

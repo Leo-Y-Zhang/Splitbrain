@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -424,6 +425,86 @@ func TestIsConnRefused(t *testing.T) {
 				t.Errorf("isConnRefused(%v) = %t, want %t", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// A peer address decides where this process sends traffic and it arrives over
+// an unauthenticated endpoint, so what counts as one is worth pinning exactly.
+func TestPeerBase(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		addr string
+		// want is the prefix every request to the peer is built from, or the
+		// empty string when the address has to be refused outright.
+		want string
+	}{
+		{"a host and port", "127.0.0.1:8080", "http://127.0.0.1:8080"},
+		{"an explicit scheme", "http://127.0.0.1:8080", "http://127.0.0.1:8080"},
+		{"https", "https://example.test:443", "https://example.test:443"},
+		{"a trailing slash", "http://127.0.0.1:8080/", "http://127.0.0.1:8080"},
+		{"a name with no port", "example.test", "http://example.test"},
+		{"IPv6", "[::1]:8080", "http://[::1]:8080"},
+		// Everything below was accepted before, and glued to the endpoint path.
+		// That is what let a configured address name any URL on a host rather
+		// than only the host.
+		{"a path", "127.0.0.1:8080/admin/wipe", ""},
+		{"a path behind a scheme", "http://127.0.0.1:8080/admin/wipe", ""},
+		{"a query", "http://127.0.0.1:8080/?ok=", ""},
+		{"a fragment", "http://127.0.0.1:8080/#x", ""},
+		{"credentials", "http://user:pass@127.0.0.1:8080", ""},
+		{"nothing at all", "", ""},
+		{"a path and no host", "/admin/wipe", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := peerBase(tc.addr)
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("peerBase(%q) = %q, want a refusal", tc.addr, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("peerBase(%q): %v", tc.addr, err)
+			}
+			if got != tc.want {
+				t.Errorf("peerBase(%q) = %q, want %q", tc.addr, got, tc.want)
+			}
+		})
+	}
+}
+
+// A Client built on an address it cannot point at must send nothing at all.
+// The address is the entire destination, so falling back to some prefix of it
+// would be worse than refusing: it would put a request somewhere nobody asked
+// for, which is the whole failure being prevented.
+func TestClientOnAnUnusableAddressNeverSends(t *testing.T) {
+	var seen atomic.Int32
+	victim := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.Add(1)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(victim.Close)
+
+	// A host with a path attached, which is what a hostile POST /configure
+	// would supply. This used to reach the victim as POST /admin/wipe/kv.
+	c := NewClient(strings.TrimPrefix(victim.URL, "http://")+"/admin/wipe", testTimeout)
+
+	_, err := c.Send(context.Background(), Request{Kind: history.Write, Key: "x", Value: 1})
+	var te *TransportError
+	if !errors.As(err, &te) {
+		t.Fatalf("Send = %v, want a *TransportError", err)
+	}
+	if !te.NeverSent {
+		t.Error("NeverSent is false, but nothing was dialled")
+	}
+	if err := c.postJSON(context.Background(), "/replicate", replication{Key: "x"}); err == nil {
+		t.Error("postJSON to an unusable address reported success")
+	}
+	if _, err := c.Health(context.Background()); err == nil {
+		t.Error("Health of an unusable address reported success")
+	}
+	if n := seen.Load(); n != 0 {
+		t.Errorf("the victim received %d requests, want none", n)
 	}
 }
 

@@ -306,10 +306,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 //
 // These stores are fixtures and POST /configure is unauthenticated on purpose,
 // which is fine on loopback and is something else entirely off it: whoever can
-// reach the port can set this node's leader to any address and path they like
-// and have it issue requests there, using this machine's network position. That
-// is not worth refusing to start over - a node run on another machine on
-// purpose is a legitimate thing to do - but it is worth saying out loud.
+// reach the port can set this node's leader to any host they like and have it
+// issue this package's endpoints there, using this machine's network position.
+// A peer address has to be a host and a port and nothing else - see peerBase,
+// which is what stops it naming a path as well - but the host is still theirs
+// to choose. That is not worth refusing to start over - a node run on another
+// machine on purpose is a legitimate thing to do - but it is worth saying out
+// loud.
 //
 // It only means anything on an address that has already been bound, because
 // then the host is a literal the kernel chose. An unspecified one - "0.0.0.0",
@@ -325,7 +328,7 @@ func exposureWarning(addr string) string {
 	}
 	return fmt.Sprintf("warning: this node is listening on %s, so it is reachable from the network. "+
 		"It is a test fixture with no authentication: anyone who can reach it can POST /configure "+
-		"and make it send requests to any address they name. Use -addr 127.0.0.1:0 unless you meant this.", addr)
+		"and make it send requests to any host they name. Use -addr 127.0.0.1:0 unless you meant this.", addr)
 }
 
 // Run is the body of every kv binary: bind, announce, serve, stop cleanly.
