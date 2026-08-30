@@ -352,4 +352,4 @@ including subtests. **No dependencies**: standard library only, and CI fails if
 
 ## Licence
 
-MIT. Copyright (c) 2026 Leo Y. Zhang.
+Proprietary source-available — see [LICENSE](LICENSE). You may read it, run it, and publish what you find, including a refutation. No reuse, modification, redistribution, or use as machine-learning training data. Copyright (c) 2026 Leo Y. Zhang.
