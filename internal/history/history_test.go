@@ -338,6 +338,43 @@ func TestValidateCatchesOverlapRegardlessOfSliceOrder(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsASharedInvokeTimeInEitherSliceOrder(t *testing.T) {
+	// One process, one invocation time, two requests one after the other: the
+	// first is instantaneous, or the second never came back. Each history is
+	// valid, and the order its operations sit in the slice carries no meaning,
+	// so it is valid whichever way round they are laid out.
+	valid := map[string]History{
+		"instantaneous, then a longer one": {
+			op(0, "x", Read, OK, 5, 5),
+			op(0, "x", Write, OK, 5, 10),
+		},
+		"instantaneous, then an indeterminate one": {
+			op(0, "x", Read, OK, 5, 5),
+			op(0, "x", Write, Info, 5, 0),
+		},
+	}
+	for name, h := range valid {
+		t.Run(name, func(t *testing.T) {
+			reversed := History{h[1], h[0]}
+			if err := h.Validate(); err != nil {
+				t.Fatalf("Validate rejected it: %v", err)
+			}
+			if err := reversed.Validate(); err != nil {
+				t.Fatalf("Validate accepted it in one slice order and rejected it in the other: %v", err)
+			}
+		})
+	}
+
+	// A real overlap that starts at one instant is still an overlap, whichever
+	// way round.
+	overlap := History{op(0, "x", Read, OK, 5, 10), op(0, "x", Read, OK, 5, 7)}
+	for _, h := range []History{overlap, {overlap[1], overlap[0]}} {
+		if err := h.Validate(); err == nil {
+			t.Fatal("Validate accepted two requests in flight at once on one process")
+		}
+	}
+}
+
 func TestPendingIsLargerThanAnyRealTimestamp(t *testing.T) {
 	// Sorting by completion time relies on this, and a smaller sentinel would
 	// silently reorder pending operations into the middle of a history.

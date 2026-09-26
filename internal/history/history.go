@@ -492,7 +492,19 @@ func (h History) Validate() error {
 	}
 
 	for proc, ops := range byProc {
-		ops.SortByInvoke()
+		// By invocation and then by completion. An instantaneous operation and
+		// a longer one can share an invocation time on one process - the first
+		// ends at the instant the second begins - and so can an operation and
+		// the indeterminate one after it. Only the order that puts the earlier
+		// completion first reads them as one request after the other, and the
+		// order the caller happened to lay the slice out in must not choose:
+		// that made one history valid or malformed depending on its layout.
+		sort.SliceStable(ops, func(i, j int) bool {
+			if ops[i].Invoke != ops[j].Invoke {
+				return ops[i].Invoke < ops[j].Invoke
+			}
+			return ops[i].Complete < ops[j].Complete
+		})
 		for i := 1; i < len(ops); i++ {
 			prev := ops[i-1]
 			// An indeterminate operation blocks its process forever in the
