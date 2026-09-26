@@ -194,6 +194,129 @@ func TestReportDrawsFaultBands(t *testing.T) {
 	}
 }
 
+// lateWindow is ten reads between 5s and 5.95s into a run: the shape of the
+// window a long run's report draws when it keeps only the operations nearest
+// the violation, so the drawing starts well after the run did.
+func lateWindow() history.History {
+	var h history.History
+	for i := 0; i < 10; i++ {
+		at := 5*time.Second + time.Duration(i)*100*time.Millisecond
+		h = append(h, history.Op{
+			Process: i, Key: "k0", Kind: history.Read, Outcome: history.OK,
+			Invoke: int64(at), Complete: int64(at + 50*time.Millisecond),
+		})
+	}
+	return h
+}
+
+// xAt is where the drawing puts instant t of lateWindow, by the same
+// arithmetic the page uses.
+func xAt(t time.Duration) int {
+	lo, hi := 5*time.Second, 5950*time.Millisecond
+	return plotLeft + int(float64(t-lo)/float64(hi-lo)*float64(pageWidth-plotLeft-plotRight))
+}
+
+func TestFaultBandsSitOverTheOperationsTheyCut(t *testing.T) {
+	// A fault's At and an operation's timestamps are both offsets from the
+	// start of the run, so a cut at 5.2s belongs over the operations running
+	// at 5.2s whatever instant the drawn window happens to start at. Measured
+	// from the window instead, this cut landed 5s further right: past the last
+	// operation, as a two-pixel sliver on the right edge, next to operations
+	// that ran on a healthy network.
+	h := lateWindow()
+	events := []faultnet.Event{
+		{At: 5200 * time.Millisecond, Link: "c1", Fault: faultnet.Drop},
+		{At: 5400 * time.Millisecond, Link: "c1", Fault: faultnet.Pass},
+	}
+	d, err := Input{Verdict: checked(t, h), History: h, Faults: events}.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Bands) != 1 {
+		t.Fatalf("drew %d bands for one cut", len(d.Bands))
+	}
+	b := d.Bands[0]
+	if want := xAt(5200 * time.Millisecond); b.X != want {
+		t.Errorf("the cut at 5.2s starts at x=%d, want %d", b.X, want)
+	}
+	if want := xAt(5400*time.Millisecond) - xAt(5200*time.Millisecond); b.W != want {
+		t.Errorf("the 200ms cut is %d pixels wide, want %d", b.W, want)
+	}
+
+	// The axis has to be on the same clock as the bands, the hover text and
+	// the command line, all of which say when things happened in the run.
+	if first, last := d.Ticks[0].Label, d.Ticks[len(d.Ticks)-1].Label; first != "5s" || last != "5.95s" {
+		t.Errorf("the axis runs from %q to %q; the drawn operations ran from 5s to 5.95s", first, last)
+	}
+}
+
+func TestFaultBandsLeaveOutCutsOutsideTheWindow(t *testing.T) {
+	// A cut that healed before the first drawn operation, or began after the
+	// last, has nothing in the drawing to sit over. Clamped to an edge it would
+	// read as a cut at that edge.
+	h := lateWindow()
+	events := []faultnet.Event{
+		{At: 1 * time.Second, Link: "c1", Fault: faultnet.Drop},
+		{At: 2 * time.Second, Link: "c1", Fault: faultnet.Pass},
+		{At: 7 * time.Second, Link: "c1", Fault: faultnet.Drop},
+		{At: 8 * time.Second, Link: "c1", Fault: faultnet.Pass},
+	}
+	d, err := Input{Verdict: checked(t, h), History: h, Faults: events}.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Bands) != 0 {
+		t.Errorf("drew %d bands for cuts that all lie outside the drawn window: %+v", len(d.Bands), d.Bands)
+	}
+
+	// One still in force when the window opens is drawn from the left edge.
+	events = []faultnet.Event{
+		{At: 4 * time.Second, Link: "c1", Fault: faultnet.Drop},
+		{At: 5200 * time.Millisecond, Link: "c1", Fault: faultnet.Pass},
+	}
+	d, err = Input{Verdict: checked(t, h), History: h, Faults: events}.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Bands) != 1 || d.Bands[0].X != plotLeft || d.Bands[0].X+d.Bands[0].W != xAt(5200*time.Millisecond) {
+		t.Errorf("a cut from 4s to 5.2s over a window opening at 5s drew %+v, want one band from x=%d to x=%d",
+			d.Bands, plotLeft, xAt(5200*time.Millisecond))
+	}
+}
+
+func TestAHealOfEveryLinkEndsTheBand(t *testing.T) {
+	// The flaky and chaos schedules cut links one by one and heal them all at
+	// once, and the nemesis heals every link when a run ends. That heal names
+	// the link "*", so counting it as one more link that is up left every
+	// individually cut link down for good: one band from the first cut to the
+	// end of the drawing, and every heal after it invisible.
+	h := lateWindow()
+	events := []faultnet.Event{
+		{At: 5100 * time.Millisecond, Link: "c1", Fault: faultnet.Drop},
+		{At: 5100 * time.Millisecond, Link: "c2->c0", Fault: faultnet.Drop},
+		{At: 5300 * time.Millisecond, Link: "*", Fault: faultnet.Pass},
+		{At: 5600 * time.Millisecond, Link: "c1", Fault: faultnet.Drop},
+		{At: 5800 * time.Millisecond, Link: "*", Fault: faultnet.Pass},
+	}
+	d, err := Input{Verdict: checked(t, h), History: h, Faults: events}.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Bands) != 2 {
+		t.Fatalf("drew %d bands for two cuts each ended by a heal of every link: %+v", len(d.Bands), d.Bands)
+	}
+	for i, span := range [][2]time.Duration{
+		{5100 * time.Millisecond, 5300 * time.Millisecond},
+		{5600 * time.Millisecond, 5800 * time.Millisecond},
+	} {
+		b := d.Bands[i]
+		if b.X != xAt(span[0]) || b.X+b.W != xAt(span[1]) {
+			t.Errorf("band %d runs from x=%d to x=%d, want %d to %d (%s to %s)",
+				i, b.X, b.X+b.W, xAt(span[0]), xAt(span[1]), span[0], span[1])
+		}
+	}
+}
+
 func TestReportNamesTheNodeAProcessTalkedTo(t *testing.T) {
 	h := violation()
 	page := render(t, Input{
