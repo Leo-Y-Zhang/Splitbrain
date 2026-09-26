@@ -561,7 +561,7 @@ func cmdSchedule(args []string) error {
 	}
 	fmt.Printf("splitbrain schedule: nodes=%d faults=%s seed=%d duration=%s links=%s\n",
 		*nodes, *faults, *seed, *duration, strings.Join(topo.LinkNames(), ","))
-	fmt.Print(sched.String())
+	fmt.Println(sched.String())
 	fmt.Printf("%d events\n", len(sched.Events()))
 	return nil
 }

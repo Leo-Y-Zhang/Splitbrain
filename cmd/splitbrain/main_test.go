@@ -403,3 +403,96 @@ func TestPlural(t *testing.T) {
 		t.Errorf("plural(2) = %q", got)
 	}
 }
+
+// stdoutOf runs f with os.Stdout redirected and returns what it printed.
+func stdoutOf(t *testing.T, f func() error) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		var b strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			b.Write(buf[:n])
+			if err != nil {
+				break
+			}
+		}
+		done <- b.String()
+	}()
+	ferr := f()
+	os.Stdout = saved
+	w.Close()
+	out := <-done
+	r.Close()
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	return out
+}
+
+// TestScheduleReplaysFromItsSeed pins what `splitbrain schedule` prints for
+// one seed. A seed is what a person keeps from a run that found something, and
+// the README promises the fault schedule replays from it: on another machine,
+// and with a later build. Two calls in one process agreeing does not show that;
+// a generator that draws its random numbers in a different order does not
+// break any other test, and it quietly turns every recorded seed into a
+// different run. If a change here is deliberate, say so where seeds are
+// published.
+func TestScheduleReplaysFromItsSeed(t *testing.T) {
+	cases := map[string][]string{
+		// The default kind, laid out by the harness from the cluster's shape.
+		"partition": {
+			"splitbrain schedule: nodes=2 faults=partition seed=3 duration=2s links=c0,c1,p0-1,p1-0",
+			"partition seed=3 for 2s, 16 events",
+			"      250ms  p0-1  drop",
+			"      250ms  p1-0  drop",
+			"     1.068s  c0    pass",
+			"     1.068s  c1    pass",
+			"     1.068s  p0-1  pass",
+			"     1.068s  p1-0  pass",
+			"     1.613s  p0-1  drop",
+			"     1.613s  p1-0  drop",
+			"      1.75s  c0    pass",
+			"      1.75s  c1    pass",
+			"      1.75s  p0-1  pass",
+			"      1.75s  p1-0  pass",
+			"      1.75s  c0    pass",
+			"      1.75s  c1    pass",
+			"      1.75s  p0-1  pass",
+			"      1.75s  p1-0  pass",
+			"16 events",
+		},
+		// A generated kind, laid out by faultnet, with a heal of every link.
+		"chaos": {
+			"splitbrain schedule: nodes=2 faults=chaos seed=3 duration=3s links=c0,c1,p0-1,p1-0",
+			"chaos seed=3 for 3s, 6 events",
+			"      365ms  p1-0  drop",
+			"      955ms  *     pass",
+			"     1.504s  p1-0  delay 138ms",
+			"     1.682s  p1-0  pass",
+			"     2.058s  p1-0  delay 96ms",
+			"     2.283s  p1-0  pass",
+			"6 events",
+		},
+	}
+	durations := map[string]string{"partition": "2s", "chaos": "3s"}
+	for kind, lines := range cases {
+		t.Run(kind, func(t *testing.T) {
+			want := strings.Join(lines, "\n") + "\n"
+			args := []string{"-nodes", "2", "-faults", kind, "-seed", "3", "-duration", durations[kind]}
+			for i := 0; i < 2; i++ {
+				got := stdoutOf(t, func() error { return cmdSchedule(args) })
+				if got != want {
+					t.Fatalf("run %d printed:\n%s\nwant:\n%s", i, got, want)
+				}
+			}
+		})
+	}
+}
