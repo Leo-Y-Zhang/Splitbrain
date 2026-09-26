@@ -15,6 +15,7 @@ package history
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -166,7 +167,7 @@ type History []Op
 // wireOp is the on-disk form. The field names are spelled out so a history
 // file can be read by a person, and by something that is not this program.
 type wireOp struct {
-	Process  int    `json:"process"`
+	Process  *int   `json:"process"`
 	Key      string `json:"key"`
 	Kind     string `json:"kind"`
 	Value    *int   `json:"value,omitempty"`
@@ -175,7 +176,7 @@ type wireOp struct {
 	Observed *int   `json:"observed,omitempty"`
 	Swapped  *bool  `json:"swapped,omitempty"`
 	Outcome  string `json:"outcome"`
-	Invoke   int64  `json:"invoke_ns"`
+	Invoke   *int64 `json:"invoke_ns"`
 	Complete *int64 `json:"complete_ns,omitempty"`
 	Err      string `json:"error,omitempty"`
 }
@@ -184,12 +185,13 @@ func intp(v int) *int    { return &v }
 func boolp(v bool) *bool { return &v }
 
 func (o Op) toWire() wireOp {
+	proc, invoke := o.Process, o.Invoke
 	w := wireOp{
-		Process: o.Process,
+		Process: &proc,
 		Key:     o.Key,
 		Kind:    o.Kind.String(),
 		Outcome: o.Outcome.String(),
-		Invoke:  o.Invoke,
+		Invoke:  &invoke,
 		Err:     o.Err,
 	}
 	switch o.Kind {
@@ -222,12 +224,15 @@ func (w wireOp) toOp() (Op, error) {
 	if err != nil {
 		return Op{}, err
 	}
+	if err := w.complete(k, oc); err != nil {
+		return Op{}, err
+	}
 	o := Op{
-		Process:  w.Process,
+		Process:  *w.Process,
 		Key:      w.Key,
 		Kind:     k,
 		Outcome:  oc,
-		Invoke:   w.Invoke,
+		Invoke:   *w.Invoke,
 		Complete: Pending,
 		Err:      w.Err,
 	}
@@ -252,6 +257,51 @@ func (w wireOp) toOp() (Op, error) {
 		return Op{}, fmt.Errorf("outcome %q needs a complete_ns", w.Outcome)
 	}
 	return o, nil
+}
+
+// complete refuses a line that leaves out a field its kind and outcome give a
+// meaning to.
+//
+// Absent and zero are different things, which is why these fields are
+// pointers, and reading an absent one as zero puts a fact into the history
+// that nobody recorded: a read that returned 0, a write of 0, a
+// compare-and-swap that reported it did not swap, an operation invoked at the
+// start of the run by process 0. The client refuses a reply with a field
+// missing rather than guess it; a history file gets the same treatment, because
+// the verdict would otherwise be about a history nobody wrote.
+func (w wireOp) complete(k Kind, oc Outcome) error {
+	if w.Process == nil {
+		return errors.New("no process")
+	}
+	if w.Invoke == nil {
+		return errors.New("no invoke_ns")
+	}
+	switch k {
+	case Write:
+		if w.Value == nil {
+			return errors.New("a write needs a value")
+		}
+	case CAS:
+		if w.From == nil || w.To == nil {
+			return errors.New("a cas needs both from and to")
+		}
+	}
+	if oc != OK {
+		// Nothing came back, or the server declined, so there is no result
+		// to record.
+		return nil
+	}
+	switch k {
+	case Read:
+		if w.Observed == nil {
+			return errors.New("a read with outcome ok needs the value it observed")
+		}
+	case CAS:
+		if w.Swapped == nil {
+			return errors.New("a cas with outcome ok needs swapped")
+		}
+	}
+	return nil
 }
 
 // Save emits the history as JSON Lines, one operation per line, sorted by

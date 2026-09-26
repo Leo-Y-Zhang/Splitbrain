@@ -134,6 +134,20 @@ func TestLoadRejectsMalformedLines(t *testing.T) {
 		"unknown kind":               `{"process":0,"key":"x","kind":"append","outcome":"ok","invoke_ns":1,"complete_ns":2}`,
 		"unknown outcome":            `{"process":0,"key":"x","kind":"read","outcome":"probably","invoke_ns":1,"complete_ns":2}`,
 		"ok with no completion time": `{"process":0,"key":"x","kind":"read","outcome":"ok","invoke_ns":1}`,
+
+		// A field left out is not a zero. Read as one, each of these lines
+		// states something nobody recorded: a read that returned 0, a write
+		// of 0, a cas that did not swap, an operation by process 0 at the
+		// start of the run.
+		"ok read with no observed value": `{"process":0,"key":"x","kind":"read","outcome":"ok","invoke_ns":1,"complete_ns":2}`,
+		"write with no value":            `{"process":0,"key":"x","kind":"write","outcome":"ok","invoke_ns":1,"complete_ns":2}`,
+		"indeterminate write, no value":  `{"process":0,"key":"x","kind":"write","outcome":"info","invoke_ns":1}`,
+		"cas with no from":               `{"process":0,"key":"x","kind":"cas","to":3,"outcome":"ok","swapped":true,"invoke_ns":1,"complete_ns":2}`,
+		"cas with no to":                 `{"process":0,"key":"x","kind":"cas","from":3,"outcome":"ok","swapped":true,"invoke_ns":1,"complete_ns":2}`,
+		"ok cas with no swapped":         `{"process":0,"key":"x","kind":"cas","from":0,"to":3,"outcome":"ok","invoke_ns":1,"complete_ns":2}`,
+		"misspelt field":                 `{"process":0,"key":"x","kind":"write","vaule":5,"outcome":"ok","invoke_ns":1,"complete_ns":2}`,
+		"no invoke time":                 `{"process":0,"key":"x","kind":"read","observed":0,"outcome":"ok","complete_ns":2}`,
+		"no process":                     `{"key":"x","kind":"read","observed":0,"outcome":"ok","invoke_ns":1,"complete_ns":2}`,
 	}
 	for name, line := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -143,6 +157,24 @@ func TestLoadRejectsMalformedLines(t *testing.T) {
 				t.Fatal("Load accepted a malformed line")
 			}
 		})
+	}
+}
+
+func TestLoadNeedsNoResultWhereNothingCameBack(t *testing.T) {
+	// The other side of the rule above: an operation with no answer, or one the
+	// server declined, has no result, and Save leaves it out.
+	in := strings.Join([]string{
+		`{"process":0,"key":"x","kind":"read","outcome":"info","invoke_ns":1}`,
+		`{"process":1,"key":"x","kind":"cas","from":0,"to":3,"outcome":"info","invoke_ns":2}`,
+		`{"process":2,"key":"x","kind":"read","outcome":"fail","invoke_ns":3,"complete_ns":4}`,
+		`{"process":3,"key":"x","kind":"cas","from":0,"to":3,"outcome":"fail","invoke_ns":5,"complete_ns":6}`,
+	}, "\n")
+	h, err := Load(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("Load refused operations that have no result to record: %v", err)
+	}
+	if len(h) != 4 {
+		t.Fatalf("want 4 ops, got %d", len(h))
 	}
 }
 
