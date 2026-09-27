@@ -286,9 +286,18 @@ func span(ops history.History) (lo, hi int64) {
 	return lo, hi
 }
 
+// everyLink is the link name a faultnet.Event carries when it applies to every
+// link at once. The flaky and chaos schedules heal a cut with one, and the
+// nemesis records one when it heals the network at the end of a run.
+const everyLink = "*"
+
 // bands draws the intervals during which at least one link was cut. The exact
 // link is not shown: what a reader needs is whether the violation happened
 // during a cut or after the heal, and a band per link would bury that.
+//
+// A fault's At is an offset from the start of the run, which is the origin the
+// history's timestamps are measured from too, so it is drawn on the operations'
+// own scale and not from wherever the drawn window happens to begin.
 func bands(events []faultnet.Event, lo, hi int64, scale func(int64) int) []faultBand {
 	if len(events) == 0 {
 		return nil
@@ -309,37 +318,56 @@ func bands(events []faultnet.Event, lo, hi int64, scale func(int64) int) []fault
 		}
 		return n
 	}
+	closeBand := func(to time.Duration) {
+		if b, ok := band(openAt, to, lo, hi, scale); ok {
+			out = append(out, b)
+		}
+		open = false
+	}
 	for _, e := range sorted {
+		if e.Link == everyLink {
+			// It overrides whatever each link was doing. Recorded as just one
+			// more link, a heal of every link left the individually cut ones
+			// down, and the band never closed.
+			clear(down)
+		}
 		down[e.Link] = e.Fault != faultnet.Pass
 		switch {
 		case !open && countDown() > 0:
 			open, openAt = true, e.At
 		case open && countDown() == 0:
-			out = append(out, band(openAt, e.At, lo, hi, scale))
-			open = false
+			closeBand(e.At)
 		}
 	}
 	if open {
-		out = append(out, band(openAt, time.Duration(hi-lo), lo, hi, scale))
+		closeBand(time.Duration(hi))
 	}
 	return out
 }
 
-func band(from, to time.Duration, lo, hi int64, scale func(int64) int) faultBand {
-	x0 := scale(lo + int64(from))
-	x1 := scale(lo + int64(to))
+// band draws one cut, or reports false when none of it falls inside the drawn
+// window. Clamped to an edge, a cut from elsewhere in the run would read as a
+// cut at that edge.
+func band(from, to time.Duration, lo, hi int64, scale func(int64) int) (faultBand, bool) {
+	if int64(to) <= lo || int64(from) >= hi {
+		return faultBand{}, false
+	}
+	x0 := scale(int64(from))
+	x1 := scale(int64(to))
 	if x1-x0 < 2 {
 		x1 = x0 + 2
 	}
-	return faultBand{X: x0, W: x1 - x0, Label: fmt.Sprintf("cut %s", from.Round(time.Millisecond)), Class: "band"}
+	return faultBand{X: x0, W: x1 - x0, Label: fmt.Sprintf("cut %s", from.Round(time.Millisecond)), Class: "band"}, true
 }
 
+// ticks labels the axis in time since the start of the run, the clock the
+// hover text, the fault bands and the command line all report in.
 func ticks(lo, hi int64, scale func(int64) int) []tick {
 	var out []tick
 	const n = 8
 	for i := 0; i <= n; i++ {
 		t := lo + (hi-lo)*int64(i)/n
-		out = append(out, tick{X: scale(t), Label: time.Duration(t - lo).Round(time.Millisecond).String()})
+		out = append(out, tick{X: scale(t), Label: time.Duration(t).Round(time.Millisecond).String()})
 	}
 	return out
 }
