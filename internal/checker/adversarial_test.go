@@ -329,3 +329,70 @@ func TestAdversarialMinimisationReproduces(t *testing.T) {
 		})
 	}
 }
+
+// TestAdversarialVerdictIgnoresLayoutAndFailedOperations reruns the degenerate
+// corpus with two things the generator above leaves out: operations the client
+// proved never happened, and a slice laid out in an arbitrary order rather than
+// the order it was generated in.
+//
+// A history's slice order carries no meaning, so every layout of one history
+// has to get the same answer, from the validator as much as from the search;
+// and a failed operation is dropped, not searched, so it must neither explain a
+// read nor get in the way of one. BruteForce, which never looks at the order,
+// is the reference for every layout.
+func TestAdversarialVerdictIgnoresLayoutAndFailedOperations(t *testing.T) {
+	const runs, layouts = 4000, 4
+	for _, shape := range adversarialShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(0x5eed1a7011, 0xfa11ed0b5))
+			var checked, withFail int
+			for i := 0; i < runs; i++ {
+				h := adversarialHistory(rng, shape)
+				failed := false
+				for j := range h {
+					if h[j].Outcome == history.OK && rng.IntN(100) < 15 {
+						h[j].Outcome = history.Fail
+						failed = true
+					}
+				}
+				if failed {
+					withFail++
+				}
+				verr := h.Validate()
+
+				for l := 0; l < layouts; l++ {
+					laid := append(history.History{}, h...)
+					rng.Shuffle(len(laid), func(a, b int) { laid[a], laid[b] = laid[b], laid[a] })
+
+					if err := laid.Validate(); (err == nil) != (verr == nil) {
+						t.Fatalf("case %d: Validate says %v for one layout and %v for another\n%s", i, verr, err, dump(h))
+					}
+					got, err := Check(laid, casReg, Options{})
+					if verr != nil {
+						if err == nil || got.Verdict == Linearizable {
+							t.Fatalf("case %d: a refused history came back as %v, error %v\n%s", i, got.Verdict, err, dump(h))
+						}
+						continue
+					}
+					if err != nil {
+						t.Fatalf("case %d: Check: %v\n%s", i, err, dump(h))
+					}
+					want, err := BruteForce(laid, casReg, 8)
+					if err != nil {
+						t.Fatalf("case %d: BruteForce: %v", i, err)
+					}
+					if got.Verdict != want {
+						t.Fatalf("case %d: Check says %v, BruteForce says %v\n%s", i, got.Verdict, want, dump(laid))
+					}
+					checked++
+				}
+			}
+			if withFail < runs/10 {
+				t.Errorf("only %d histories carried a failed operation", withFail)
+			}
+			if checked < runs {
+				t.Errorf("only %d layouts were checked against the reference", checked)
+			}
+		})
+	}
+}
